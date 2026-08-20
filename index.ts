@@ -27,10 +27,20 @@ export function saveConfig(cfg: AgentRouterConfig): void {
     }
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
   } catch {}
+export function normalizeApiKey(key?: string): string {
+  if (!key) return "";
+  let clean = key.trim().replace(/^["']|["']$/g, "").trim();
+  if (clean.toLowerCase().startsWith("bearer ")) {
+    clean = clean.slice(7).trim();
+  }
+  if (clean.startsWith("sk-")) {
+    clean = clean.slice(3).trim();
+  }
+  return clean;
 }
 
 const initialConfig = loadConfig();
-let currentApiKey = process.env.AGENTROUTER_API_KEY || initialConfig.apiKey || "";
+let currentApiKey = normalizeApiKey(process.env.AGENTROUTER_API_KEY || initialConfig.apiKey || "");
 let minIntervalMs = initialConfig.minIntervalMs ?? 2500;
 let lastRequestTime = 0;
 
@@ -201,15 +211,16 @@ export default function (pi: ExtensionAPI) {
       const action = parts[0]?.toLowerCase();
 
       if (action === "key" || action === "set-key") {
-        const newKey = parts[1]?.trim();
-        if (!newKey || newKey.length < 5) {
+        const rawKey = parts[1]?.trim();
+        const cleanKey = normalizeApiKey(rawKey);
+        if (!cleanKey || cleanKey.length < 5) {
           ctx.ui.notify("Please provide a valid API key: /agentrouter key <your-key>", "error");
           return;
         }
-        currentApiKey = newKey;
-        saveConfig({ apiKey: newKey, minIntervalMs });
-        registerAgentRouterProviders(newKey);
-        ctx.ui.notify("AgentRouter API key updated successfully for all models.", "info");
+        currentApiKey = cleanKey;
+        saveConfig({ apiKey: cleanKey, minIntervalMs });
+        registerAgentRouterProviders(cleanKey);
+        ctx.ui.notify("AgentRouter API key updated and normalized successfully for all models.", "info");
         return;
       }
 
