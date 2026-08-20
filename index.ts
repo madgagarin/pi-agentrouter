@@ -110,8 +110,30 @@ export default function (pi: ExtensionAPI) {
 
   registerAgentRouterProviders(currentApiKey);
 
+  function updatePromptRewriteEnvForModel(model?: any): void {
+    if (isAgentRouter(model?.provider, model?.baseUrl)) {
+      process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE = "1";
+    } else {
+      delete process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
+    }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    updatePromptRewriteEnvForModel(ctx.model);
+    lastRequestTime = Date.now();
+  });
+
+  pi.on("model_select", async (event) => {
+    updatePromptRewriteEnvForModel(event.model);
+  });
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    updatePromptRewriteEnvForModel(ctx.model);
+  });
+
   pi.on("turn_start", async (_event, ctx) => {
     const model = ctx.model;
+    updatePromptRewriteEnvForModel(model);
     if (!isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
       return;
     }
