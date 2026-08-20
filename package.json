@@ -1,0 +1,50 @@
+{
+  "name": "@madgagarin/pi-agentrouter",
+  "version": "1.0.0",
+  "description": "Pi coding agent extension for AgentRouter (GPT-5.6 Sol & Claude Opus 5) with rate-limit pacing and caching.",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "agentrouter",
+    "openai",
+    "claude",
+    "gpt-5",
+    "claude-opus",
+    "extension"
+  ],
+  "author": "madgagarin (https://github.com/madgagarin)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/madgagarin/pi-agentrouter.git"
+  },
+  "homepage": "https://github.com/madgagarin/pi-agentrouter#readme",
+  "bugs": {
+    "url": "https://github.com/madgagarin/pi-agentrouter/issues"
+  },
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.82.0"
+  },
+  "dependencies": {
+    "pi-cache-optimizer": "^2.8.3"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  }
+}
