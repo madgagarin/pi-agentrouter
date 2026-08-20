@@ -59,6 +59,9 @@ export default function (pi: ExtensionAPI) {
           contextWindow: 1048576,
           maxTokens: 131072,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: {
+            sendSessionAffinityHeaders: true,
+          },
         },
       ],
     });
@@ -80,6 +83,9 @@ export default function (pi: ExtensionAPI) {
           contextWindow: 524288,
           maxTokens: 65536,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: {
+            forceAdaptiveThinking: true,
+          },
         },
         {
           id: "claude-opus-5",
@@ -89,6 +95,9 @@ export default function (pi: ExtensionAPI) {
           contextWindow: 1048576,
           maxTokens: 65536,
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: {
+            forceAdaptiveThinking: true,
+          },
         },
       ],
     });
