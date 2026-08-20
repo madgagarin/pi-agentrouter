@@ -1,4 +1,4 @@
-# @madgagarin/pi-agentrouter
+# pi-agentrouter
 
 [![npm version](https://img.shields.io/npm/v/@madgagarin/pi-agentrouter.svg?color=blue)](https://www.npmjs.com/package/@madgagarin/pi-agentrouter)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)

@@ -31,14 +31,7 @@ export function saveConfig(cfg: AgentRouterConfig): void {
 
 export function normalizeApiKey(key?: string): string {
   if (!key) return "";
-  let clean = key.trim().replace(/^["']|["']$/g, "").trim();
-  if (clean.toLowerCase().startsWith("bearer ")) {
-    clean = clean.slice(7).trim();
-  }
-  if (clean.startsWith("sk-")) {
-    clean = clean.slice(3).trim();
-  }
-  return clean;
+  return key.trim().replace(/^["']|["']$/g, "").trim();
 }
 
 const initialConfig = loadConfig();
@@ -222,7 +215,7 @@ export default function (pi: ExtensionAPI) {
         currentApiKey = cleanKey;
         saveConfig({ apiKey: cleanKey, minIntervalMs });
         registerAgentRouterProviders(cleanKey);
-        ctx.ui.notify("AgentRouter API key updated and normalized successfully for all models.", "info");
+        ctx.ui.notify("AgentRouter API key updated successfully for all models.", "info");
         return;
       }
 

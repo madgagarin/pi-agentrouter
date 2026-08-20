@@ -1,6 +1,6 @@
 {
   "name": "@madgagarin/pi-agentrouter",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Pi coding agent extension for AgentRouter (GPT-5.6 Sol & Claude Opus 5) with rate-limit pacing and caching.",
   "publishConfig": {
     "access": "public"
