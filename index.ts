@@ -27,6 +27,8 @@ export function saveConfig(cfg: AgentRouterConfig): void {
     }
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), "utf-8");
   } catch {}
+}
+
 export function normalizeApiKey(key?: string): string {
   if (!key) return "";
   let clean = key.trim().replace(/^["']|["']$/g, "").trim();
