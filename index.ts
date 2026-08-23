@@ -90,7 +90,27 @@ export function fixPackagePriorityInSettings(): boolean {
 const initialConfig = loadConfig();
 let currentApiKey = normalizeApiKey(process.env.AGENTROUTER_API_KEY || initialConfig.apiKey || "");
 let minIntervalMs = initialConfig.minIntervalMs ?? 2500;
-let lastRequestEndTime = 0;
+const PACING_FILE = path.join(process.env.HOME || "", ".pi/agent/.agentrouter-pacing");
+
+export function getLastRequestEndTime(): number {
+  try {
+    if (fs.existsSync(PACING_FILE)) {
+      const val = parseInt(fs.readFileSync(PACING_FILE, "utf-8").trim(), 10);
+      if (!isNaN(val)) return val;
+    }
+  } catch {}
+  return 0;
+}
+
+export function setLastRequestEndTime(ts: number): void {
+  try {
+    const dir = path.dirname(PACING_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(PACING_FILE, String(ts), "utf-8");
+  } catch {}
+}
 
 export function isAgentRouter(providerName?: string, baseUrl?: string): boolean {
   if (providerName && providerName.toLowerCase().includes("agentrouter")) return true;
@@ -129,8 +149,18 @@ export default function (pi: ExtensionAPI) {
       baseUrl: "https://agentrouter.org",
       apiKey,
       api: "anthropic-messages",
+      headers: {
+        "User-Agent": "claude-cli/1.0.108 (external, cli)",
+        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27",
+        "x-stainless-lang": "js",
+        "x-stainless-package-version": "0.38.0",
+        "x-stainless-os": "Linux",
+        "x-stainless-arch": "x64",
+        "x-stainless-runtime": "node"
+      },
       compat: {
         forceAdaptiveThinking: true,
+        sendSessionAffinityHeaders: true,
       },
       models: [
         {
@@ -143,6 +173,7 @@ export default function (pi: ExtensionAPI) {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           compat: {
             forceAdaptiveThinking: true,
+            sendSessionAffinityHeaders: true,
           },
         },
         {
@@ -155,6 +186,7 @@ export default function (pi: ExtensionAPI) {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           compat: {
             forceAdaptiveThinking: true,
+            sendSessionAffinityHeaders: true,
           },
         },
       ],
@@ -173,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     updatePromptRewriteEnvForModel(ctx.model);
-    lastRequestEndTime = Date.now();
+    setLastRequestEndTime(Date.now());
 
     const order = getPackageOrderState();
     if (order.needsFix && ctx.hasUI && typeof (ctx.ui as any).confirm === "function") {
@@ -209,10 +241,11 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const lastEnd = getLastRequestEndTime();
     const now = Date.now();
-    const elapsed = now - lastRequestEndTime;
+    const elapsed = now - lastEnd;
 
-    if (lastRequestEndTime > 0 && elapsed < minIntervalMs) {
+    if (lastEnd > 0 && elapsed < minIntervalMs) {
       const waitMs = minIntervalMs - elapsed;
       await new Promise((resolve) => setTimeout(resolve, waitMs));
     }
@@ -221,14 +254,14 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_end", async (_event, ctx) => {
     const model = ctx.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
-      lastRequestEndTime = Date.now();
+      setLastRequestEndTime(Date.now());
     }
   });
 
   pi.on("agent_end", async (_event, ctx) => {
     const model = ctx.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
-      lastRequestEndTime = Date.now();
+      setLastRequestEndTime(Date.now());
     }
   });
 
@@ -276,6 +309,7 @@ export default function (pi: ExtensionAPI) {
           signal,
         }
       );
+      setLastRequestEndTime(Date.now());
 
       const summary = response.content
         .filter((c: any): c is { type: "text"; text: string } => c.type === "text")

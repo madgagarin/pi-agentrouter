@@ -120,6 +120,9 @@ AgentRouter performs client fingerprint verification. Raw summarization requests
 #### Q: Does the 2.5s pacing delay affect local or other cloud models?
 No. The pacing logic specifically filters for AgentRouter endpoints (`isAgentRouter`). Native OpenAI, Anthropic, Gemini, or local models run at full speed without delay.
 
+#### Q: How to use custom subagents with AgentRouter?
+AgentRouter strictly verifies client authenticity (`pi-code` / `claude-code` prompt signature). If you define custom subagents in extensions like `pi-subagents`, make sure to specify `systemPromptMode: append` in your agent definition frontmatter so the base Pi system prompt identity is preserved.
+
 ---
 
 ## 📄 License
