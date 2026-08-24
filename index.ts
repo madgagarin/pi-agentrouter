@@ -118,7 +118,8 @@ export function isAgentRouter(providerName?: string, baseUrl?: string): boolean 
   return false;
 }
 
-export const CANONICAL_PI_HEADER = "You are pi, an expert AI coding assistant.";
+export const CANONICAL_PI_HEADER =
+  "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
 /**
  * Enforces that the canonical pi-code system prompt signature is strictly at index 0.
@@ -134,7 +135,7 @@ export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefi
 
   if (typeof systemPrompt === "string") {
     const text = systemPrompt.trim();
-    const piHeaderRegex = /(?:You are (?:pi|Pi)[^\n\r]*\n?)/i;
+    const piHeaderRegex = /(?:You are [^\n\r]*operating inside pi[^\n\r]*\n?|You are (?:pi|Pi)[^\n\r]*\n?)/i;
 
     if (piHeaderRegex.test(text)) {
       const match = text.match(piHeaderRegex);
