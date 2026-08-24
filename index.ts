@@ -118,6 +118,52 @@ export function isAgentRouter(providerName?: string, baseUrl?: string): boolean 
   return false;
 }
 
+export const CANONICAL_PI_HEADER = "You are pi, an expert AI coding assistant.";
+
+/**
+ * Enforces that the canonical pi-code system prompt signature is strictly at index 0.
+ * If another plugin or wrapper prepended text before the canonical header, it reorders
+ * the header to the very top and shifts the injected prefix right after it.
+ * If the header is missing entirely (e.g. from replace mode), it prepends the canonical header.
+ * This guarantees both WAF client authentication and stable prompt cache prefix matching.
+ */
+export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefined): string | any[] {
+  if (!systemPrompt) {
+    return CANONICAL_PI_HEADER;
+  }
+
+  if (typeof systemPrompt === "string") {
+    const text = systemPrompt.trim();
+    const piHeaderRegex = /(?:You are (?:pi|Pi)[^\n\r]*\n?)/i;
+
+    if (piHeaderRegex.test(text)) {
+      const match = text.match(piHeaderRegex);
+      if (match && match.index !== undefined && match.index > 0) {
+        const header = match[0].trim();
+        const prefix = text.slice(0, match.index).trim();
+        const rest = text.slice(match.index + match[0].length).trim();
+        return `${header}\n\n${prefix}${rest ? "\n\n" + rest : ""}`;
+      }
+      return text;
+    } else {
+      return `${CANONICAL_PI_HEADER}\n\n${text}`;
+    }
+  }
+
+  if (Array.isArray(systemPrompt)) {
+    if (systemPrompt.length === 0) {
+      return [{ type: "text", text: CANONICAL_PI_HEADER }];
+    }
+    const firstBlock = systemPrompt[0];
+    if (firstBlock && typeof firstBlock.text === "string") {
+      firstBlock.text = enforceCanonicalRootPrompt(firstBlock.text) as string;
+    }
+    return systemPrompt;
+  }
+
+  return systemPrompt;
+}
+
 export default function (pi: ExtensionAPI) {
   function registerAgentRouterProviders(apiKey: string): void {
     pi.registerProvider("agentrouter-openai", {
@@ -194,6 +240,34 @@ export default function (pi: ExtensionAPI) {
       delete process.env.PI_CACHE_OPTIMIZER_NO_PROMPT_REWRITE;
     }
   }
+
+    // Enforce root system prompt signature and prompt prefix stability at the lowest transport level
+  pi.on("before_provider_request", async (event, ctx) => {
+    const provider = ((event as any)?.model?.provider || ctx?.model?.provider || "").toLowerCase();
+    const baseUrl = ((event as any)?.model?.baseUrl || (ctx?.model as any)?.baseUrl || "");
+
+    if (isAgentRouter(provider, baseUrl)) {
+      const payload = event.payload;
+      if (payload) {
+        // 1. Enforce canonical root system prompt in payload.system (Anthropic format)
+        if (payload.system !== undefined) {
+          payload.system = enforceCanonicalRootPrompt(payload.system);
+        }
+
+        // 2. Enforce canonical root system prompt in payload.messages[0] (OpenAI format)
+        if (Array.isArray(payload.messages) && payload.messages.length > 0) {
+          const firstMsg = payload.messages[0];
+          if (firstMsg && firstMsg.role === "system") {
+            if (typeof firstMsg.content === "string") {
+              firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+            } else if (Array.isArray(firstMsg.content)) {
+              firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+            }
+          }
+        }
+      }
+    }
+  });
 
   pi.on("session_start", async (_event, ctx) => {
     updatePromptRewriteEnvForModel(ctx.model);
