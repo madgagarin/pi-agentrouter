@@ -89,7 +89,7 @@ export function fixPackagePriorityInSettings(): boolean {
 
 const initialConfig = loadConfig();
 let currentApiKey = normalizeApiKey(process.env.AGENTROUTER_API_KEY || initialConfig.apiKey || "");
-let minIntervalMs = initialConfig.minIntervalMs ?? 2500;
+let minIntervalMs = initialConfig.minIntervalMs ?? 3500;
 const PACING_FILE = path.join(process.env.HOME || "", ".pi/agent/.agentrouter-pacing");
 
 export function getLastRequestEndTime(): number {
@@ -188,6 +188,18 @@ export default function (pi: ExtensionAPI) {
             sendSessionAffinityHeaders: true,
           },
         },
+        {
+          id: "deepseek-v4f",
+          name: "deepseek-v4f",
+          reasoning: true,
+          input: ["text"],
+          contextWindow: 131072,
+          maxTokens: 65536,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: {
+            sendSessionAffinityHeaders: true,
+          },
+        },
       ],
     });
 
@@ -196,10 +208,11 @@ export default function (pi: ExtensionAPI) {
       baseUrl: "https://agentrouter.org",
       apiKey,
       api: "anthropic-messages",
-      
       compat: {
         forceAdaptiveThinking: true,
+        allowEmptySignature: true,
         sendSessionAffinityHeaders: true,
+        supportsEagerToolInputStreaming: false,
       },
       models: [
         {
@@ -212,7 +225,9 @@ export default function (pi: ExtensionAPI) {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           compat: {
             forceAdaptiveThinking: true,
+            allowEmptySignature: true,
             sendSessionAffinityHeaders: true,
+            supportsEagerToolInputStreaming: false,
           },
         },
         {
@@ -225,7 +240,9 @@ export default function (pi: ExtensionAPI) {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           compat: {
             forceAdaptiveThinking: true,
+            allowEmptySignature: true,
             sendSessionAffinityHeaders: true,
+            supportsEagerToolInputStreaming: false,
           },
         },
       ],
@@ -242,20 +259,27 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-    // Enforce root system prompt signature and prompt prefix stability at the lowest transport level
+  // Inter-request pacing to respect AgentRouter WAF rate limits and enforce canonical root prompt
   pi.on("before_provider_request", async (event, ctx) => {
     const provider = ((event as any)?.model?.provider || ctx?.model?.provider || "").toLowerCase();
     const baseUrl = ((event as any)?.model?.baseUrl || (ctx?.model as any)?.baseUrl || "");
 
     if (isAgentRouter(provider, baseUrl)) {
+      // 1. Cross-process request pacing
+      const lastEnd = getLastRequestEndTime();
+      const now = Date.now();
+      const elapsed = now - lastEnd;
+      if (lastEnd > 0 && elapsed < minIntervalMs) {
+        const waitMs = minIntervalMs - elapsed;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+
+      // 2. Enforce canonical root system prompt in payload (Anthropic & OpenAI formats)
       const payload = event.payload;
       if (payload) {
-        // 1. Enforce canonical root system prompt in payload.system (Anthropic format)
         if (payload.system !== undefined) {
           payload.system = enforceCanonicalRootPrompt(payload.system);
         }
-
-        // 2. Enforce canonical root system prompt in payload.messages[0] (OpenAI format)
         if (Array.isArray(payload.messages) && payload.messages.length > 0) {
           const firstMsg = payload.messages[0];
           if (firstMsg && firstMsg.role === "system") {
@@ -267,6 +291,28 @@ export default function (pi: ExtensionAPI) {
           }
         }
       }
+    }
+    return undefined;
+  });
+
+  pi.on("message_end", async (_event, ctx) => {
+    const model = ctx?.model;
+    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
+      setLastRequestEndTime(Date.now());
+    }
+  });
+
+  pi.on("turn_end", async (_event, ctx) => {
+    const model = ctx?.model;
+    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
+      setLastRequestEndTime(Date.now());
+    }
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    const model = ctx?.model;
+    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
+      setLastRequestEndTime(Date.now());
     }
   });
 
@@ -315,20 +361,6 @@ export default function (pi: ExtensionAPI) {
     if (lastEnd > 0 && elapsed < minIntervalMs) {
       const waitMs = minIntervalMs - elapsed;
       await new Promise((resolve) => setTimeout(resolve, waitMs));
-    }
-  });
-
-  pi.on("turn_end", async (_event, ctx) => {
-    const model = ctx.model;
-    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
-      setLastRequestEndTime(Date.now());
-    }
-  });
-
-  pi.on("agent_end", async (_event, ctx) => {
-    const model = ctx.model;
-    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
-      setLastRequestEndTime(Date.now());
     }
   });
 

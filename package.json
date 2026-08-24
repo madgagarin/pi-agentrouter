@@ -1,7 +1,7 @@
 {
   "name": "@madgagarin/pi-agentrouter",
-  "version": "1.3.0",
-  "description": "Pi coding agent extension for AgentRouter (GPT-5.6 Sol & Claude Opus 5) with rate-limit pacing and caching.",
+  "version": "1.4.0",
+  "description": "Pi coding agent extension for AgentRouter (GPT-5.6 Sol, Claude Opus 5, DeepSeek V4F) with rate-limit pacing, prompt caching, and WAF protection.",
   "publishConfig": {
     "access": "public"
   },
@@ -17,6 +17,8 @@
     "gpt-5.6-sol",
     "claude-opus-5",
     "claude-opus-4-8",
+    "deepseek-v4f",
+    "deepseek",
     "prompt-caching",
     "openai",
     "claude",
