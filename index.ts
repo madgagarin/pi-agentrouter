@@ -149,15 +149,7 @@ export default function (pi: ExtensionAPI) {
       baseUrl: "https://agentrouter.org",
       apiKey,
       api: "anthropic-messages",
-      headers: {
-        "User-Agent": "claude-cli/1.0.108 (external, cli)",
-        "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,context-management-2025-06-27",
-        "x-stainless-lang": "js",
-        "x-stainless-package-version": "0.38.0",
-        "x-stainless-os": "Linux",
-        "x-stainless-arch": "x64",
-        "x-stainless-runtime": "node"
-      },
+      
       compat: {
         forceAdaptiveThinking: true,
         sendSessionAffinityHeaders: true,
