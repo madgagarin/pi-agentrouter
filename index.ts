@@ -41,6 +41,16 @@ export interface ApiPricingModel {
 }
 
 export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
+  "gpt-6-astra": {
+    id: "gpt-6-astra",
+    name: "gpt-6-astra",
+    providerType: "openai",
+    contextWindow: 1048576,
+    maxTokens: 131072,
+    reasoning: true,
+    compat: { sendSessionAffinityHeaders: true },
+    cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+  },
   "deepseek-v4-flash": {
     id: "deepseek-v4-flash",
     name: "deepseek-v4-flash",
@@ -49,7 +59,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: true },
-    cost: { input: 2.0 / 1_000_000, output: 6.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "deepseek-v4f": {
     id: "deepseek-v4f",
@@ -59,7 +69,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: true },
-    cost: { input: 2.0 / 1_000_000, output: 6.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "glm-5.3": {
     id: "glm-5.3",
@@ -129,7 +139,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
       sendSessionAffinityHeaders: true,
       supportsEagerToolInputStreaming: false,
     },
-    cost: { input: 8.0 / 1_000_000, output: 40.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 6.0 / 1_000_000, output: 30.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "claude-opus-4-7": {
     id: "claude-opus-4-7",
@@ -270,6 +280,36 @@ export function fixPackagePriorityInSettings(): boolean {
     }
   } catch {}
   return false;
+}
+
+export const FLAGSHIP_MODELS: string[] = [
+  "agentrouter-openai/deepseek-v4-flash",
+  "agentrouter-openai/gpt-6-astra",
+  "agentrouter-openai/gpt-5.6-sol",
+  "agentrouter-clode/claude-opus-5",
+  "agentrouter-clode/claude-opus-4-8",
+];
+
+export function syncEnabledModelsInSettings(): { added: string[]; count: number } {
+  try {
+    if (!fs.existsSync(SETTINGS_FILE)) return { added: [], count: 0 };
+    const settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+    if (!Array.isArray(settings.enabledModels)) return { added: [], count: 0 };
+
+    const added: string[] = [];
+    for (const m of FLAGSHIP_MODELS) {
+      if (!settings.enabledModels.includes(m)) {
+        settings.enabledModels.push(m);
+        added.push(m);
+      }
+    }
+    if (added.length > 0) {
+      fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf-8");
+    }
+    return { added, count: settings.enabledModels.length };
+  } catch {
+    return { added: [], count: 0 };
+  }
 }
 
 export function getLastRequestEndTime(): number {
@@ -427,10 +467,12 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
       return { model: modelId, status: "READY", code: res.status };
     }
 
-    const data = await res.json().catch(() => ({}));
-    const msg = data.error?.message || data.message || "";
-
-    if (res.status === 402 || msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("exhausted")) {
+    if (
+      res.status === 402 ||
+      msg.toLowerCase().includes("quota") ||
+      msg.toLowerCase().includes("exhausted") ||
+      msg.toLowerCase().includes("budget pool")
+    ) {
       return { model: modelId, status: "QUOTA_EXHAUSTED", code: 402, message: msg };
     }
     if (res.status === 403) {
@@ -647,11 +689,13 @@ export default function (pi: ExtensionAPI) {
     currentApiKey = getEffectiveApiKey();
     updatePromptRewriteEnvForModel(ctx.model);
     setLastRequestEndTime(Date.now());
+    syncEnabledModelsInSettings();
 
     fetchLivePricing().then((livePricing) => {
       if (livePricing) {
         saveCachedPricing(livePricing);
         const newModels = registerAgentRouterProviders(currentApiKey, livePricing);
+        syncEnabledModelsInSettings();
         if (newModels.length > 0 && ctx.hasUI) {
           ctx.ui.notify(
             `[AgentRouter] Discovered new models on gateway: ${newModels.join(", ")}.\n` +
@@ -798,7 +842,18 @@ export default function (pi: ExtensionAPI) {
         currentApiKey = cleanKey;
         saveConfig({ apiKey: cleanKey, minIntervalMs });
         registerAgentRouterProviders(cleanKey, loadCachedPricing());
+        syncEnabledModelsInSettings();
         ctx.ui.notify("AgentRouter API key updated successfully for all models.", "info");
+        return;
+      }
+
+      if (action === "sync" || action === "enable-models") {
+        const res = syncEnabledModelsInSettings();
+        if (res.added.length > 0) {
+          ctx.ui.notify(`[AgentRouter] Added to enabledModels: ${res.added.join(", ")} (total: ${res.count}).`, "info");
+        } else {
+          ctx.ui.notify(`[AgentRouter] All flagship models already enabled in settings.json (total: ${res.count}).`, "info");
+        }
         return;
       }
 
@@ -893,10 +948,10 @@ export default function (pi: ExtensionAPI) {
             }))
           : [
               { id: "deepseek-v4-flash", isAnthropic: false },
-              { id: "glm-5.3", isAnthropic: false },
+              { id: "gpt-6-astra", isAnthropic: false },
               { id: "gpt-5.6-sol", isAnthropic: false },
-              { id: "claude-opus-4-8", isAnthropic: true },
               { id: "claude-opus-5", isAnthropic: true },
+              { id: "claude-opus-4-8", isAnthropic: true },
             ];
 
         const probeResults = await Promise.all(
@@ -924,7 +979,7 @@ export default function (pi: ExtensionAPI) {
         }
 
         report +=
-          `\nTip: Claude and GPT models use daily batch quotas. If exhausted, switch to DeepSeek V4 or GLM 5.3 which have unlimited availability.`;
+          `\nTip: Claude and GPT models use daily batch quotas. If exhausted, switch to DeepSeek V4 Flash which has unlimited availability.`;
 
         ctx.ui.notify(report, "info");
         return;
@@ -948,7 +1003,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.0.0]\n` +
+        `[AgentRouter Plugin v2.1.0]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
@@ -956,6 +1011,7 @@ export default function (pi: ExtensionAPI) {
           `- Commands:\n` +
           `   /agentrouter check        (probe live batch quotas & spending)\n` +
           `   /agentrouter pricing      (fetch live pricing table $/1M)\n` +
+          `   /agentrouter sync         (sync enabledModels in settings.json)\n` +
           `   /agentrouter key <key>    (update API key)\n` +
           `   /agentrouter pacing <ms>  (adjust rate limit delay)\n` +
           `   /agentrouter fix-order    (move plugin above pi-cache-optimizer)`,

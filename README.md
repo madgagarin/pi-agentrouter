@@ -5,9 +5,9 @@
 [![Pi Plugin](https://img.shields.io/badge/Pi-Extension-purple.svg)](https://pi.dev)
 [![AgentRouter Gateway](https://img.shields.io/badge/Gateway-agentrouter.org-orange.svg)](https://agentrouter.org)
 
-Use **GPT-5.6 Sol**, **Claude Opus 5**, **Claude Opus 4.8**, **DeepSeek V4 Flash**, and **GLM 5.3** in your [Pi Coding Agent](https://pi.dev) using a single API key from [AgentRouter](https://agentrouter.org).
+Use **GPT-6 Astra**, **GPT-5.6 Sol**, **Claude Opus 5**, **Claude Opus 4.8**, and **DeepSeek V4 Flash** in your [Pi Coding Agent](https://pi.dev) using a single API key from [AgentRouter](https://agentrouter.org).
 
-> 🎁 **Free Trial Credits:** New to AgentRouter? Get up to **$175 in free credits** (including a **+$50 bonus**) to test GPT-5.6, Claude Opus 5, and DeepSeek V4 — no credit card needed. That's enough for **over 80,000,000 tokens** on DeepSeek V4!  
+> 🎁 **Free Trial Credits:** New to AgentRouter? Get up to **$175 in free credits** (including a **+$50 bonus**) to test GPT-6 Astra, Claude Opus 5, and DeepSeek V4 — no credit card needed. That's enough for **millions of tokens** on DeepSeek V4!  
 > 👉 **[Claim your free trial credits on AgentRouter.org →](https://agentrouter.org/register?aff=34dc)**
 
 ---
@@ -40,6 +40,7 @@ pi install npm:@madgagarin/pi-agentrouter
 
 This plugin fixes all of that automatically:
 
+- **Zero-Config Model Sync:** Automatically adds active AgentRouter models into `enabledModels` in your `settings.json` so models appear in `Ctrl+P` without manual edits.
 - **Live USD Pricing in Pi:** Pulls current rates from [agentrouter.org/api/pricing](https://agentrouter.org/api/pricing) on startup so Pi's built-in cost tracking shows your exact spend in dollars.
 - **Live Quota Monitor (`/agentrouter check`):** Quick health check that pings all models to see if daily batch quotas are open, and displays your monthly usage in USD.
 - **1M Context Windows:** All models are configured with their full 1,048,576 token context limits and native reasoning/adaptive thinking.
@@ -55,13 +56,13 @@ Rates are pulled directly from the [agentrouter.org](https://agentrouter.org) ga
 
 | Model | Provider | Context | Output | Reasoning | Input / 1M | Output / 1M | Quota Policy |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `deepseek-v4-flash` | `agentrouter-openai` | 1M | 64K | Yes | $2.00 | $6.00 | Unlimited |
-| `glm-5.3` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $12.00 | Unlimited |
+| `deepseek-v4-flash` | `agentrouter-openai` | 1M | 64K | Yes | $4.00 | $12.00 | Unlimited |
+| `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
 | `gpt-5.6-sol` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
-| `claude-opus-5` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $8.00 | $40.00 | Daily batch drops |
+| `claude-opus-5` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $6.00 | $30.00 | Daily batch drops |
 | `claude-opus-4-8` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $8.00 | $40.00 | Daily batch drops |
 
-*Note: Claude and GPT models are released in daily batches on AgentRouter. If you hit a 402, run `/agentrouter check` to verify, and switch to `deepseek-v4-flash` or `glm-5.3` for unlimited coding.*
+*Note: Claude and GPT models are released in daily batches on AgentRouter. If you hit a 402, run `/agentrouter check` to verify, and switch to `deepseek-v4-flash` for unlimited coding.*
 
 ---
 
@@ -72,6 +73,7 @@ Rates are pulled directly from the [agentrouter.org](https://agentrouter.org) ga
 | `/agentrouter` | Overview of active model, current monthly USD spend, package order, and pacing delay. |
 | `/agentrouter check` | Live preflight probe of all model quotas (200 OK vs 402) and monthly usage. |
 | `/agentrouter pricing` | Fetches and prints the latest official pricing table from [agentrouter.org](https://agentrouter.org). |
+| `/agentrouter sync` | Automatically syncs active flagship models into `enabledModels` in `settings.json`. |
 | `/agentrouter key <key>` | Sets API key and syncs it across `agentrouter.json` and Pi's `auth.json`. |
 | `/agentrouter pacing <ms>` | Sets delay between consecutive requests (default: `3500` ms). |
 | `/agentrouter fix-order` | Places this plugin above `pi-cache-optimizer` in `settings.json` if needed. |
@@ -83,7 +85,7 @@ Rates are pulled directly from the [agentrouter.org](https://agentrouter.org) ga
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Ctrl + P` | Cycle to next model (`deepseek-v4-flash` ➔ `glm-5.3` ➔ `gpt-5.6-sol` ➔ `claude-opus-5` ➔ `claude-opus-4-8`) |
+| `Ctrl + P` | Cycle to next model (`deepseek-v4-flash` ➔ `gpt-6-astra` ➔ `gpt-5.6-sol` ➔ `claude-opus-5` ➔ `claude-opus-4-8`) |
 | `Shift + Ctrl + P` | Cycle to previous model |
 | `Shift + Tab` | Toggle reasoning depth (`off` ➔ `minimal` ➔ `low` ➔ `medium` ➔ `high`) |
 | `Ctrl + T` | Toggle reasoning block visibility |
@@ -102,7 +104,7 @@ Add this to `~/.pi/agent/settings.json` for convenient model switching:
   "defaultThinkingLevel": "low",
   "enabledModels": [
     "agentrouter-openai/deepseek-v4-flash",
-    "agentrouter-openai/glm-5.3",
+    "agentrouter-openai/gpt-6-astra",
     "agentrouter-openai/gpt-5.6-sol",
     "agentrouter-clode/claude-opus-5",
     "agentrouter-clode/claude-opus-4-8"
