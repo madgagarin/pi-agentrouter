@@ -207,7 +207,6 @@ export function saveConfig(cfg: AgentRouterConfig): void {
       }
       auth["agentrouter-openai"] = { type: "api_key", key: cfg.apiKey };
       auth["agentrouter-clode"] = { type: "api_key", key: cfg.apiKey };
-      auth["anthropic"] = { type: "api_key", key: cfg.apiKey };
       fs.writeFileSync(authPath, JSON.stringify(auth, null, 2), "utf-8");
     }
   } catch {}
@@ -378,6 +377,107 @@ export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefi
   return systemPrompt;
 }
 
+export function cleanJsonSchemaObject(schema: any): void {
+  if (!schema || typeof schema !== "object") return;
+
+  if (schema.type === "object" || schema.properties) {
+    if (schema.required === null || schema.required === undefined || !Array.isArray(schema.required)) {
+      schema.required = [];
+    }
+  }
+
+  if (schema.properties && typeof schema.properties === "object") {
+    for (const [propName, propDef] of Object.entries(schema.properties)) {
+      if (propDef && typeof propDef === "object") {
+        cleanJsonSchemaObject(propDef);
+      }
+    }
+  }
+
+  if (schema.items) {
+    if (typeof schema.items === "object") {
+      cleanJsonSchemaObject(schema.items);
+    } else if (schema.items === null) {
+      delete schema.items;
+    }
+  }
+}
+
+export function sanitizeOpenAiTools(tools: any[]): void {
+  if (!Array.isArray(tools)) return;
+  for (const tool of tools) {
+    if (!tool || typeof tool !== "object") continue;
+    const fn = tool.function || tool;
+    if (fn.parameters && typeof fn.parameters === "object") {
+      cleanJsonSchemaObject(fn.parameters);
+    }
+  }
+}
+
+export function normalizeMessagesForAgentRouter(messages: any[]): void {
+  if (!Array.isArray(messages)) return;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role === "developer") {
+      msg.role = "system";
+    }
+    if (msg.role === "assistant") {
+      let extractedThinking: string | undefined;
+
+      if (Array.isArray(msg.content)) {
+        const thinkingParts: string[] = [];
+        const nonThinkingParts: any[] = [];
+
+        for (const part of msg.content) {
+          if (part && typeof part === "object" && (part.type === "thinking" || part.type === "reasoning")) {
+            const text = part.thinking || part.text;
+            if (text) thinkingParts.push(text);
+          } else {
+            nonThinkingParts.push(part);
+          }
+        }
+
+        if (thinkingParts.length > 0) {
+          extractedThinking = thinkingParts.join("\n");
+        }
+
+        if (nonThinkingParts.length === 0) {
+          msg.content = "";
+        } else if (nonThinkingParts.length === 1 && nonThinkingParts[0].type === "text") {
+          msg.content = nonThinkingParts[0].text;
+        } else {
+          msg.content = nonThinkingParts;
+        }
+      }
+
+      if (extractedThinking && !msg.reasoning_content) {
+        msg.reasoning_content = extractedThinking;
+      }
+
+      // If assistant executed tool calls, AgentRouter DeepSeek proxy strictly requires reasoning_content
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 && !msg.reasoning_content) {
+        msg.reasoning_content = "Executing tools...";
+      }
+    }
+  }
+}
+
+let lastWarnedErrorTimestamp = 0;
+export function checkAndNotifyContentBlocked(errMessage: string | undefined, ctx: any): void {
+  if (!errMessage) return;
+  const now = Date.now();
+  if (now - lastWarnedErrorTimestamp < 2000) return;
+  if (errMessage.includes("content-blocked")) {
+    lastWarnedErrorTimestamp = now;
+    const tip = "[AgentRouter] Request was blocked by upstream gateway content filter (content-blocked).";
+    if (ctx?.hasUI) {
+      ctx.ui.notify(tip, "warning");
+    } else {
+      console.warn(`\n⚠️  ${tip}\n`);
+    }
+  }
+}
+
 export async function fetchLivePricing(): Promise<ApiPricingModel[] | null> {
   try {
     const res = await fetch("https://agentrouter.org/api/pricing", {
@@ -529,6 +629,17 @@ export default function (pi: ExtensionAPI) {
           } else {
             openaiModels.push(modelObj);
           }
+          if (spec.id === "deepseek-v4-flash" && item.supported_endpoint_types.includes("anthropic")) {
+            claudeModels.push({
+              ...modelObj,
+              compat: {
+                forceAdaptiveThinking: true,
+                allowEmptySignature: true,
+                sendSessionAffinityHeaders: true,
+                supportsEagerToolInputStreaming: false,
+              },
+            });
+          }
         } else {
           newModels.push(id);
           const isAnthropic =
@@ -576,6 +687,17 @@ export default function (pi: ExtensionAPI) {
           claudeModels.push(modelObj);
         } else {
           openaiModels.push(modelObj);
+        }
+        if (spec.id === "deepseek-v4-flash") {
+          claudeModels.push({
+            ...modelObj,
+            compat: {
+              forceAdaptiveThinking: true,
+              allowEmptySignature: true,
+              sendSessionAffinityHeaders: true,
+              supportsEagerToolInputStreaming: false,
+            },
+          });
         }
       }
     }
@@ -644,11 +766,8 @@ export default function (pi: ExtensionAPI) {
           payload.system = enforceCanonicalRootPrompt(payload.system);
         }
         if (Array.isArray(payload.messages) && payload.messages.length > 0) {
-          for (const msg of payload.messages) {
-            if (msg && msg.role === "developer") {
-              msg.role = "system";
-            }
-          }
+          normalizeMessagesForAgentRouter(payload.messages);
+
           const firstMsg = payload.messages[0];
           if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
             firstMsg.role = "system";
@@ -659,22 +778,33 @@ export default function (pi: ExtensionAPI) {
             }
           }
         }
+        if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+          sanitizeOpenAiTools(payload.tools);
+        }
       }
     }
     return undefined;
   });
 
-  pi.on("message_end", async (_event, ctx) => {
+  pi.on("message_end", async (event, ctx) => {
     const model = ctx?.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
       setLastRequestEndTime(Date.now());
+      const msg = (event as any)?.message;
+      if (msg && msg.role === "assistant" && msg.stopReason === "error") {
+        checkAndNotifyContentBlocked(msg.errorMessage, ctx);
+      }
     }
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("turn_end", async (event, ctx) => {
     const model = ctx?.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
       setLastRequestEndTime(Date.now());
+      const msg = (event as any)?.message;
+      if (msg && msg.role === "assistant" && msg.stopReason === "error") {
+        checkAndNotifyContentBlocked(msg.errorMessage, ctx);
+      }
     }
   });
 
@@ -1003,7 +1133,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.1.0]\n` +
+        `[AgentRouter Plugin v2.1.1]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +

@@ -34,50 +34,49 @@ pi install npm:@madgagarin/pi-agentrouter
 
 ---
 
-## Why use this plugin?
+## Features
 
-[AgentRouter](https://agentrouter.org) ([agentrouter.org](https://agentrouter.org)) provides affordable unified access to frontier LLMs, but using raw OpenAI/Anthropic proxy configurations in Pi often runs into edge cases: Cloudflare WAF checks, rate-limit bursts from parallel subagents, prompt caching cache misses, and role naming conflicts.
-
-This plugin fixes all of that automatically:
-
-- **Zero-Config Model Sync:** Automatically adds active AgentRouter models into `enabledModels` in your `settings.json` so models appear in `Ctrl+P` without manual edits.
-- **Live USD Pricing in Pi:** Pulls current rates from [agentrouter.org/api/pricing](https://agentrouter.org/api/pricing) on startup so Pi's built-in cost tracking shows your exact spend in dollars.
-- **Live Quota Monitor (`/agentrouter check`):** Quick health check that pings all models to see if daily batch quotas are open, and displays your monthly usage in USD.
-- **1M Context Windows:** All models are configured with their full 1,048,576 token context limits and native reasoning/adaptive thinking.
-- **Cross-Process Rate Pacing:** Uses a shared lock file (`~/.pi/agent/.agentrouter-pacing`) so background subagents (`pi-subagents`) and the main chat won't trip 429 rate limits.
-- **Zero 400 & 401 Errors:** Handles canonical `pi-code` prompt header placement for WAF authorization and automatically normalizes OpenAI `developer` roles to `system`.
-- **High Cache Hit Rates (>80%):** Preserves session affinity headers and disables destructive prompt rewriting on AgentRouter routes.
+- **Model Synchronization:** Automatically registers and adds active models to `enabledModels` in `settings.json` for quick selection via `Ctrl+P`.
+- **DeepSeek Multi-Turn Tool Calling:** Preserves `reasoning_content` and handles thinking blocks across multi-step tool execution, avoiding API 400 errors.
+- **Schema Sanitization:** Automatically normalizes tool definitions (e.g. converting `required: null` to empty arrays) for strict OpenAI schema validation compatibility.
+- **WAF Diagnostics:** Intercepts upstream `content-blocked` responses and displays a clear notification in the terminal and UI.
+- **Dual Endpoint Protocols:** Supports both OpenAI (`agentrouter-openai`) and Anthropic Messages API (`agentrouter-clode`) routes for models like `deepseek-v4-flash`.
+- **Isolated Credential Storage:** Manages API keys exclusively within `agentrouter-*` provider namespaces in `auth.json` without modifying default third-party provider keys.
+- **Live Pricing & Quota Probing:** Fetches current rates from the gateway API on startup and provides `/agentrouter check` to probe model availability and track usage.
+- **Subagent Rate Pacing:** Uses a file-based lock (`~/.pi/agent/.agentrouter-pacing`) across concurrent subagents to prevent 429 rate limit errors.
+- **Prompt Caching Compatibility:** Preserves affinity headers and formatting required for upstream prompt cache reuse.
 
 ---
 
 ## Models & Pricing
 
-Rates are pulled directly from the [agentrouter.org](https://agentrouter.org) gateway API ($2.00 / 1M tokens base unit):
+Rates are fetched from the [agentrouter.org](https://agentrouter.org) gateway API ($2.00 / 1M tokens base unit):
 
 | Model | Provider | Context | Output | Reasoning | Input / 1M | Output / 1M | Quota Policy |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `deepseek-v4-flash` | `agentrouter-openai` | 1M | 64K | Yes | $4.00 | $12.00 | Unlimited |
+| `deepseek-v4-flash` | `agentrouter-openai` / `agentrouter-clode` | 1M | 64K | Yes | $4.00 | $12.00 | Unlimited |
+| `glm-5.3` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $12.00 | Unlimited |
 | `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
 | `gpt-5.6-sol` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
 | `claude-opus-5` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $6.00 | $30.00 | Daily batch drops |
 | `claude-opus-4-8` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $8.00 | $40.00 | Daily batch drops |
 
-*Note: Claude and GPT models are released in daily batches on AgentRouter. If you hit a 402, run `/agentrouter check` to verify, and switch to `deepseek-v4-flash` for unlimited coding.*
+*Note: Claude and GPT models are released in daily batches on AgentRouter. When a batch is exhausted (HTTP 402), use `/agentrouter check` to monitor status or switch to `deepseek-v4-flash` / `glm-5.3` for unrestricted usage.*
 
 ---
 
 ## In-Chat Commands
 
-| Command | What it does |
+| Command | Description |
 | :--- | :--- |
-| `/agentrouter` | Overview of active model, current monthly USD spend, package order, and pacing delay. |
-| `/agentrouter check` | Live preflight probe of all model quotas (200 OK vs 402) and monthly usage. |
-| `/agentrouter pricing` | Fetches and prints the latest official pricing table from [agentrouter.org](https://agentrouter.org). |
-| `/agentrouter sync` | Automatically syncs active flagship models into `enabledModels` in `settings.json`. |
-| `/agentrouter key <key>` | Sets API key and syncs it across `agentrouter.json` and Pi's `auth.json`. |
-| `/agentrouter pacing <ms>` | Sets delay between consecutive requests (default: `3500` ms). |
-| `/agentrouter fix-order` | Places this plugin above `pi-cache-optimizer` in `settings.json` if needed. |
-| `/compact` | Compresses chat history safely without 401 authorization drops. |
+| `/agentrouter` | Show active model, current monthly spend, extension ordering, and pacing delay. |
+| `/agentrouter check` | Probe model availability (200 OK vs 402) and display monthly usage. |
+| `/agentrouter pricing` | Display current pricing table from [agentrouter.org](https://agentrouter.org). |
+| `/agentrouter sync` | Sync active flagship models into `enabledModels` in `settings.json`. |
+| `/agentrouter key <key>` | Set API key and store it in `agentrouter.json` and `auth.json`. |
+| `/agentrouter pacing <ms>` | Configure delay between requests (default: `3500` ms). |
+| `/agentrouter fix-order` | Reorder extension before `pi-cache-optimizer` in `settings.json` if necessary. |
+| `/compact` | Compact conversation history while preserving required gateway headers. |
 
 ---
 
@@ -95,7 +94,7 @@ Rates are pulled directly from the [agentrouter.org](https://agentrouter.org) ga
 
 ## Recommended `settings.json`
 
-Add this to `~/.pi/agent/settings.json` for convenient model switching:
+Add this to `~/.pi/agent/settings.json` for model switching:
 
 ```json
 {
@@ -130,3 +129,4 @@ AgentRouter requires the base `pi-code` prompt signature for authentication. If 
 ## License
 
 MIT © [madgagarin](https://github.com/madgagarin)
+
