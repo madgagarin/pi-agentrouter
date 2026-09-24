@@ -36,15 +36,14 @@ pi install npm:@madgagarin/pi-agentrouter
 
 ## Features
 
+- **DeepSeek Multi-Turn Tool Calling:** Seamlessly flattens multi-turn tool history and preserves `reasoning_content` across tool execution turns, completely preventing upstream gateway 400 thinking mode errors.
 - **Model Synchronization:** Automatically registers and adds active models to `enabledModels` in `settings.json` for quick selection via `Ctrl+P`.
-- **DeepSeek Multi-Turn Tool Calling:** Preserves `reasoning_content` and handles thinking blocks across multi-step tool execution, avoiding API 400 errors.
 - **Schema Sanitization:** Automatically normalizes tool definitions (e.g. converting `required: null` to empty arrays) for strict OpenAI schema validation compatibility.
-- **WAF Diagnostics:** Intercepts upstream `content-blocked` responses and displays a clear notification in the terminal and UI.
-- **Dual Endpoint Protocols:** Supports both OpenAI (`agentrouter-openai`) and Anthropic Messages API (`agentrouter-clode`) routes for models like `deepseek-v4-flash`.
+- **WAF Diagnostics & Safe Redaction:** Intercepts upstream blocks and safely redacts older messages while preserving thinking placeholders for reasoning models.
 - **Isolated Credential Storage:** Manages API keys exclusively within `agentrouter-*` provider namespaces in `auth.json` without modifying default third-party provider keys.
 - **Live Pricing & Quota Probing:** Fetches current rates from the gateway API on startup and provides `/agentrouter check` to probe model availability and track usage.
 - **Subagent Rate Pacing:** Uses a file-based lock (`~/.pi/agent/.agentrouter-pacing`) across concurrent subagents to prevent 429 rate limit errors.
-- **Prompt Caching Compatibility:** Preserves affinity headers and formatting required for upstream prompt cache reuse.
+- **Prompt Caching Compatibility:** Preserves affinity headers and pricing for prompt caching reuse.
 
 ---
 
@@ -52,12 +51,12 @@ pi install npm:@madgagarin/pi-agentrouter
 
 Rates are fetched from the [agentrouter.org](https://agentrouter.org) gateway API ($2.00 / 1M tokens base unit):
 
-| Model | Provider | Context | Output | Reasoning | Input / 1M | Output / 1M | Quota Policy |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `deepseek-v4-flash` | `agentrouter-openai` / `agentrouter-clode` | 1M | 64K | Yes | $4.00 | $12.00 | Unlimited |
-| `glm-5.3` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $12.00 | Unlimited |
-| `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
-| `gpt-5.6-sol` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | Daily batch drops |
+| Model | Provider | Context | Output | Reasoning | Input / 1M | Output / 1M | Cache Read / 1M | Quota Policy |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `deepseek-v4-flash` | `agentrouter-openai` | 1M | 64K | Yes | $4.00 | $12.00 | $2.00 | Unlimited |
+| `glm-5.3` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $12.00 | - | Unlimited |
+| `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | - | Daily batch drops |
+| `gpt-5.6-sol` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | - | Daily batch drops |
 | `claude-opus-5` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $6.00 | $30.00 | Daily batch drops |
 | `claude-opus-4-8` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $8.00 | $40.00 | Daily batch drops |
 

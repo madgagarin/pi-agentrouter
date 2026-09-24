@@ -59,7 +59,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: true },
-    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
   "deepseek-v4f": {
     id: "deepseek-v4f",
@@ -69,7 +69,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: true },
-    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
   "glm-5.3": {
     id: "glm-5.3",
@@ -377,6 +377,19 @@ export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefi
   return systemPrompt;
 }
 
+export function isDeepSeekRequest(event: any, ctx: any): boolean {
+  const modelId = (
+    (event as any)?.model?.id ||
+    (ctx as any)?.model?.id ||
+    (event as any)?.payload?.model ||
+    ""
+  ).toLowerCase();
+  return modelId.includes("deepseek");
+}
+export const WAF_BLOCK_RE = /sensitive[_ ]words?[_ ]detected|content-blocked/i;
+export const SENSITIVE_WORDS_RE = /sensitive[_ ]words?[_ ]detected/i;
+export const REDACTED_NOTE = "[Message withheld by local policy]";
+
 export function cleanJsonSchemaObject(schema: any): void {
   if (!schema || typeof schema !== "object") return;
 
@@ -414,8 +427,351 @@ export function sanitizeOpenAiTools(tools: any[]): void {
   }
 }
 
-export function normalizeMessagesForAgentRouter(messages: any[]): void {
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+export const redactSet = new Set<string>();
+export let escalatePending = false;
+export let isSensitiveBlock = false;
+export let exhausted = false;
+export let sessionAnchor: string | null = null;
+export let wafNotified = false;
+
+export function resetPoisonRedactionState(): void {
+  redactSet.clear();
+  escalatePending = false;
+  isSensitiveBlock = false;
+  exhausted = false;
+  sessionAnchor = null;
+  wafNotified = false;
+}
+
+export function triggerEscalation(sensitive: boolean = false): void {
+  escalatePending = true;
+  isSensitiveBlock = sensitive;
+}
+
+
+export function fingerprintOf(msg: Record<string, unknown>): string {
+  const tc = Array.isArray(msg.tool_calls) ? JSON.stringify(msg.tool_calls).slice(0, 80) : "";
+  if (msg.type === "function_call" || msg.type === "function_call_output") {
+    return `${msg.type}:${(msg as any).call_id}:${JSON.stringify((msg as any).arguments ?? (msg as any).output ?? "").slice(0, 160)}`;
+  }
+  return `${msg.role ?? msg.type}:${JSON.stringify(msg.content ?? "").slice(0, 160)}:${tc}`;
+}
+
+export function firstUserAnchor(messages: unknown[]): string {
+  for (const m of messages) {
+    if (isRecord(m) && isHumanUserMessage(m as Record<string, unknown>)) return fingerprintOf(m);
+  }
+  return String(messages.length);
+}
+
+export function isTextBlock(block: Record<string, unknown>): boolean {
+  return block.type === "text" || block.type === "input_text" || block.type === "output_text";
+}
+
+export function isHumanUserMessage(msg: Record<string, unknown>): boolean {
+  if (msg.role !== "user") return false;
+  if (typeof msg.content === "string") return true;
+  if (Array.isArray(msg.content)) {
+    const hasToolResult = msg.content.some((b) => isRecord(b) && b.type === "tool_result");
+    const hasHumanText = msg.content.some(
+      (b) =>
+        isRecord(b) &&
+        (b.type === "text" || b.type === "input_text") &&
+        typeof b.text === "string" &&
+        b.text.trim().length > 0 &&
+        b.text !== REDACTED_NOTE
+    );
+    if (hasToolResult && !hasHumanText) return false;
+    return true;
+  }
+  return false;
+}
+
+export function lastHumanUserIndex(messages: unknown[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (isRecord(messages[i]) && isHumanUserMessage(messages[i] as Record<string, unknown>)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+export function hasRedactableText(content: unknown, msg?: Record<string, unknown>): boolean {
+  if (msg) {
+    if (msg.details && (typeof msg.details === "string" || Object.keys(msg.details).length > 0)) return true;
+    if (typeof (msg as any).reasoning_content === "string" && (msg as any).reasoning_content.length > 0) return true;
+    if (typeof (msg as any).thinking === "string" && (msg as any).thinking.length > 0) return true;
+  }
+  if (msg?.type === "function_call") return typeof (msg as any).arguments === "string" && (msg as any).arguments !== "{}";
+  if (msg?.type === "function_call_output") return hasRedactableText((msg as any).output);
+  if (typeof content === "string") return content.length > 0 && content !== REDACTED_NOTE;
+  if (Array.isArray(content)) {
+    for (const b of content) {
+      if (!isRecord(b)) continue;
+      if (b.type === "thinking" || b.type === "reasoning") return true;
+      if (isTextBlock(b) && typeof b.text === "string" && b.text.length > 0 && b.text !== REDACTED_NOTE) return true;
+      if (b.type === "tool_result") {
+        if (typeof b.content === "string" && b.content.length > 0 && b.content !== REDACTED_NOTE) return true;
+        if (Array.isArray(b.content)) {
+          for (const c of b.content) {
+            if (isRecord(c) && isTextBlock(c) && typeof c.text === "string" && c.text.length > 0 && c.text !== REDACTED_NOTE) {
+              return true;
+            }
+          }
+        }
+      }
+      if (b.type === "tool_use" && isRecord(b.input) && Object.keys(b.input).length > 0) {
+        return true;
+      }
+      if (b.type === "toolCall" && isRecord(b.arguments) && Object.keys(b.arguments).length > 0) {
+        return true;
+      }
+    }
+  }
+  if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+    for (const tc of msg.tool_calls) {
+      if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === "string" && tc.function.arguments !== "{}") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+export function redactBlocks(content: unknown): void {
+  if (!Array.isArray(content)) return;
+  for (let idx = content.length - 1; idx >= 0; idx--) {
+    const block = content[idx];
+    if (!isRecord(block)) continue;
+
+    // For thinking / reasoning blocks, keep a harmless placeholder rather than deleting,
+    // because thinking models (like DeepSeek) strictly require thinking blocks to be present in multi-turn history
+    if (block.type === "thinking" || block.type === "reasoning") {
+      if (typeof (block as any).thinking === "string") {
+        (block as any).thinking = "Thinking...";
+      }
+      if (typeof (block as any).text === "string") {
+        (block as any).text = "Thinking...";
+      }
+      continue;
+    }
+
+    if (isTextBlock(block) && typeof block.text === "string") {
+      block.text = REDACTED_NOTE;
+    } else if (block.type === "tool_result") {
+      if (typeof block.content === "string") {
+        block.content = REDACTED_NOTE;
+      } else if (Array.isArray(block.content)) {
+        for (const b of block.content) {
+          if (isRecord(b) && isTextBlock(b) && typeof b.text === "string") {
+            b.text = REDACTED_NOTE;
+          }
+        }
+      }
+    } else if (block.type === "tool_use") {
+      block.input = {};
+    } else if (block.type === "toolCall") {
+      block.arguments = {};
+    }
+  }
+}
+
+export function isHideable(msg: Record<string, unknown>): boolean {
+  return (
+    msg.role === "user" ||
+    msg.role === "assistant" ||
+    msg.role === "tool" ||
+    msg.role === "toolResult" ||
+    msg.type === "function_call" ||
+    msg.type === "function_call_output"
+  );
+}
+
+export function redactMessageAt(messages: unknown[], i: number): void {
+  const msg = messages[i];
+  if (!isRecord(msg)) return;
+
+  // Clear tool result details / raw diffs / attachments
+  if ("details" in msg) delete msg.details;
+  // DeepSeek and reasoning models require reasoning_content/thinking to exist in thinking mode.
+  // Never delete them completely; keep a sanitized minimal placeholder.
+  if ("reasoning_content" in msg) {
+    (msg as any).reasoning_content = "Thinking...";
+  }
+  if ("thinking" in msg) {
+    (msg as any).thinking = "Thinking...";
+  }
+
+  if (msg.type === "function_call") {
+    (msg as any).arguments = "{}";
+    return;
+  }
+  if (msg.type === "function_call_output") {
+    if (typeof (msg as any).output === "string") (msg as any).output = REDACTED_NOTE;
+    else redactBlocks((msg as any).output);
+    return;
+  }
+  if (typeof msg.content === "string") {
+    msg.content = REDACTED_NOTE;
+  } else if (Array.isArray(msg.content)) {
+    redactBlocks(msg.content);
+    if (msg.content.length === 0 && !Array.isArray(msg.tool_calls)) {
+      msg.content = [{ type: "text", text: REDACTED_NOTE }];
+    }
+  } else if (msg.role === "tool" || msg.role === "toolResult" || msg.role === "assistant") {
+    msg.content = REDACTED_NOTE;
+  }
+  if (Array.isArray(msg.tool_calls)) {
+    for (const tc of msg.tool_calls) {
+      if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === "string") {
+        tc.function.arguments = "{}";
+      }
+    }
+  }
+}
+
+export function applyPoisonRedaction(payload: Record<string, unknown>): void {
+  const messages = Array.isArray(payload.messages) ? payload.messages : (payload as any).input;
+  if (!Array.isArray(messages) || messages.length === 0) return;
+
+  // Prune failed assistant messages carrying error status/text in-place so dead error turns do not linger
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!isRecord(m)) continue;
+    if (m.role === "assistant") {
+      if (m.stopReason === "error") {
+        messages.splice(i, 1);
+      } else if (typeof m.content === "string" && WAF_BLOCK_RE.test(m.content)) {
+        messages.splice(i, 1);
+      }
+    }
+  }
+
+  const fps = messages.map((m) => (isRecord(m) ? fingerprintOf(m) : ""));
+
+  const anchor = firstUserAnchor(messages);
+  if (anchor !== sessionAnchor) {
+    const firstContact = sessionAnchor === null;
+    sessionAnchor = anchor;
+    if (!firstContact) {
+      redactSet.clear();
+      escalatePending = false;
+      isSensitiveBlock = false;
+      exhausted = false;
+      wafNotified = false;
+    }
+  }
+
+  if (redactSet.size > 0 && !fps.some((fp) => fp && redactSet.has(fp))) {
+    redactSet.clear();
+  }
+
+  const lastHumanUser = lastHumanUserIndex(messages);
+
+  for (let i = 0; i < messages.length; i++) {
+    if (i === lastHumanUser) continue;
+    if (!isRecord(messages[i]) || !isHideable(messages[i] as Record<string, unknown>)) continue;
+    if (redactSet.has(fps[i])) redactMessageAt(messages, i);
+  }
+
+  if (escalatePending) {
+    escalatePending = false;
+    const sensitive = isSensitiveBlock;
+    isSensitiveBlock = false;
+
+    if (sensitive) {
+      // Sensitive words detected: neutralize ALL turns (older user, tool, assistant, active tool results) except active human user
+      for (let i = 0; i < messages.length; i++) {
+        if (i === lastHumanUser) continue;
+        if (!isRecord(messages[i])) continue;
+        const m = messages[i] as Record<string, unknown>;
+        if (!isHideable(m)) continue;
+        redactSet.add(fps[i]);
+        if (hasRedactableText(m.content, m)) {
+          redactMessageAt(messages, i);
+        }
+      }
+    } else {
+      // Language ratio block: Stage 1 older user turns, Stage 2 assistant & tool
+      let anyRedacted = false;
+      for (let i = 0; i < messages.length; i++) {
+        if (i === lastHumanUser) continue;
+        if (!isRecord(messages[i])) continue;
+        const m = messages[i] as Record<string, unknown>;
+        if (m.role !== "user") continue;
+        if (redactSet.has(fps[i])) continue;
+        redactSet.add(fps[i]);
+        if (hasRedactableText(m.content, m)) {
+          redactMessageAt(messages, i);
+          anyRedacted = true;
+        }
+      }
+      if (!anyRedacted) {
+        for (let i = 0; i < messages.length; i++) {
+          if (i === lastHumanUser) continue;
+          if (!isRecord(messages[i])) continue;
+          const m = messages[i] as Record<string, unknown>;
+          if (!isHideable(m) || m.role === "user") continue;
+          if (redactSet.has(fps[i])) continue;
+          redactSet.add(fps[i]);
+          if (hasRedactableText(m.content, m)) {
+            redactMessageAt(messages, i);
+            anyRedacted = true;
+          }
+        }
+      }
+    }
+  }
+
+  // Exhausted if there are no more hideable messages left to redact other than lastHumanUser
+  exhausted = true;
+  for (let i = 0; i < messages.length; i++) {
+    if (i === lastHumanUser) continue;
+    if (!isRecord(messages[i]) || !isHideable(messages[i] as Record<string, unknown>)) continue;
+    if (!redactSet.has(fps[i])) {
+      exhausted = false;
+      break;
+    }
+  }
+}
+
+export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boolean = false): void {
   if (!Array.isArray(messages)) return;
+
+  // Prune poisoned/failed assistant turns globally across all models (e.g. prior 402 quota failure, network errors, empty turns)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role === "assistant") {
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      const hasToolUseBlocks =
+        Array.isArray(msg.content) &&
+        msg.content.some((b: any) => b && typeof b === "object" && (b.type === "tool_use" || b.type === "tool_call"));
+      const hasTools = hasToolCalls || hasToolUseBlocks;
+      const isEmptyContent =
+        !msg.content ||
+        msg.content === "" ||
+        (Array.isArray(msg.content) && (
+          msg.content.length === 0 ||
+          msg.content.every((b: any) => b && typeof b === "object" && (b.type === "text" || b.type === "input_text") && (!b.text || b.text.trim() === ""))
+        ));
+
+      if (
+        msg.stopReason === "error" ||
+        (msg.stopReason === "aborted" && isEmptyContent) ||
+        (typeof msg.content === "string" && WAF_BLOCK_RE.test(msg.content)) ||
+        (isEmptyContent && !hasTools && !msg.reasoning_content)
+      ) {
+        messages.splice(i, 1);
+      }
+    }
+  }
+
+
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
     if (msg.role === "developer") {
@@ -455,11 +811,155 @@ export function normalizeMessagesForAgentRouter(messages: any[]): void {
       }
 
       // If assistant executed tool calls, AgentRouter DeepSeek proxy strictly requires reasoning_content
-      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0 && !msg.reasoning_content) {
+      if (
+        Array.isArray(msg.tool_calls) &&
+        msg.tool_calls.length > 0 &&
+        (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim()))
+      ) {
         msg.reasoning_content = "Executing tools...";
       }
+
+      // If DeepSeek model and content is still empty without tool calls, provide fallback text
+      if (isDeepSeek && (!msg.content || msg.content === "") && (!Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0)) {
+        msg.content = "[Interrupted]";
+        if (!msg.reasoning_content) {
+          msg.reasoning_content = "Interrupted response";
+        }
+      }
+    }
+
+    if (isDeepSeek) {
+      // Flatten past assistant tool_calls into text and convert tool roles into user turns.
+      // This prevents AgentRouter's upstream Anthropic gateway from rejecting the request with:
+      // "400: The `content[].thinking` in the thinking mode must be passed back to the API."
+      if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        let contentStr = typeof msg.content === "string" ? msg.content : "";
+        for (const tc of msg.tool_calls) {
+          const fnName = tc?.function?.name || tc?.name || "tool";
+          const fnArgs = tc?.function?.arguments || "{}";
+          contentStr += (contentStr ? "\n" : "") + `[Tool Call]: ${fnName}(${fnArgs})`;
+        }
+        msg.content = contentStr;
+        delete msg.tool_calls;
+        if (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim())) {
+          msg.reasoning_content = "Executing tools...";
+        }
+      }
+
+      if (msg.role === "tool" || msg.role === "toolResult") {
+        const text = typeof msg.content === "string" ? msg.content : "";
+        const toolName = (msg as any).toolName || (msg as any).name || "tool";
+        msg.role = "user";
+        msg.content = `[Tool Result for ${toolName}]:\n${text}`;
+        delete msg.tool_call_id;
+        delete (msg as any).toolCallId;
+      }
+
     }
   }
+}
+
+export function cleanupDeepSeekDuplicates(): {
+  cleanedSettings: boolean;
+  cleanedCache: boolean;
+  cleanedModelsJson: boolean;
+} {
+  let cleanedSettings = false;
+  let cleanedCache = false;
+  let cleanedModelsJson = false;
+
+  // 1. Clean settings.json
+  try {
+    if (fs.existsSync(SETTINGS_FILE)) {
+      const settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+      let modified = false;
+
+      if (Array.isArray(settings.enabledModels)) {
+        const clodeIdx = settings.enabledModels.indexOf("agentrouter-clode/deepseek-v4-flash");
+        if (clodeIdx !== -1) {
+          settings.enabledModels.splice(clodeIdx, 1);
+          modified = true;
+        }
+        // Deduplicate enabledModels
+        const seen = new Set<string>();
+        const deduped: string[] = [];
+        for (const m of settings.enabledModels) {
+          if (!seen.has(m)) {
+            seen.add(m);
+            deduped.push(m);
+          } else {
+            modified = true;
+          }
+        }
+        settings.enabledModels = deduped;
+      }
+
+      if (settings.subagents && typeof settings.subagents === "object" && settings.subagents.agentOverrides) {
+        for (const override of Object.values(settings.subagents.agentOverrides)) {
+          if ((override as any)?.model === "agentrouter-clode/deepseek-v4-flash") {
+            (override as any).model = "agentrouter-openai/deepseek-v4-flash";
+            modified = true;
+          }
+        }
+      }
+
+      if (settings.defaultProvider === "agentrouter-clode" && settings.defaultModel === "deepseek-v4-flash") {
+        settings.defaultProvider = "agentrouter-openai";
+        modified = true;
+      }
+
+      if (modified) {
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf-8");
+        cleanedSettings = true;
+      }
+    }
+  } catch {}
+
+  // 2. Clean MODELS_CACHE_FILE (.agentrouter-models-cache.json)
+  try {
+    if (fs.existsSync(MODELS_CACHE_FILE)) {
+      const cacheData = JSON.parse(fs.readFileSync(MODELS_CACHE_FILE, "utf-8"));
+      if (Array.isArray(cacheData)) {
+        let modified = false;
+        for (const item of cacheData) {
+          if (item && item.model_name === "deepseek-v4-flash") {
+            if (Array.isArray(item.supported_endpoint_types) && item.supported_endpoint_types.includes("anthropic")) {
+              item.supported_endpoint_types = item.supported_endpoint_types.filter((t: string) => t !== "anthropic");
+              modified = true;
+            }
+          }
+        }
+        if (modified) {
+          fs.writeFileSync(MODELS_CACHE_FILE, JSON.stringify(cacheData, null, 2), "utf-8");
+          cleanedCache = true;
+        }
+      }
+    }
+  } catch {}
+
+  // 3. Clean models.json (if present)
+  try {
+    const modelsJsonPath = path.join(process.env.HOME || "", ".pi/agent/models.json");
+    if (fs.existsSync(modelsJsonPath)) {
+      const modelsJson = JSON.parse(fs.readFileSync(modelsJsonPath, "utf-8"));
+      let modified = false;
+      if (modelsJson?.providers?.["agentrouter-clode"]?.models) {
+        const origLen = modelsJson.providers["agentrouter-clode"].models.length;
+        modelsJson.providers["agentrouter-clode"].models = modelsJson.providers["agentrouter-clode"].models.filter(
+          (m: any) => (typeof m === "string" ? m !== "deepseek-v4-flash" : m?.id !== "deepseek-v4-flash")
+        );
+        if (modelsJson.providers["agentrouter-clode"].models.length !== origLen) {
+          modified = true;
+        }
+      }
+      if (modified) {
+        fs.writeFileSync(modelsJsonPath, JSON.stringify(modelsJson, null, 2), "utf-8");
+        cleanedModelsJson = true;
+      }
+    }
+  } catch {}
+
+  return { cleanedSettings, cleanedCache, cleanedModelsJson };
 }
 
 let lastWarnedErrorTimestamp = 0;
@@ -481,7 +981,7 @@ export function checkAndNotifyContentBlocked(errMessage: string | undefined, ctx
 export async function fetchLivePricing(): Promise<ApiPricingModel[] | null> {
   try {
     const res = await fetch("https://agentrouter.org/api/pricing", {
-      headers: { "User-Agent": "pi-code" },
+      
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -505,8 +1005,7 @@ export async function fetchTokenUsage(apiKey: string): Promise<number | null> {
       {
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          "User-Agent": "pi-code",
-        },
+          },
       }
     );
     if (!res.ok) return null;
@@ -532,12 +1031,12 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
         "Content-Type": "application/json",
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
-        "User-Agent": "pi-code",
+        "User-Agent": getPiUserAgent(),
       }
     : {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
-        "User-Agent": "pi-code",
+        "User-Agent": getPiUserAgent(),
       };
 
   const body = isAnthropic
@@ -629,17 +1128,6 @@ export default function (pi: ExtensionAPI) {
           } else {
             openaiModels.push(modelObj);
           }
-          if (spec.id === "deepseek-v4-flash" && item.supported_endpoint_types.includes("anthropic")) {
-            claudeModels.push({
-              ...modelObj,
-              compat: {
-                forceAdaptiveThinking: true,
-                allowEmptySignature: true,
-                sendSessionAffinityHeaders: true,
-                supportsEagerToolInputStreaming: false,
-              },
-            });
-          }
         } else {
           newModels.push(id);
           const isAnthropic =
@@ -688,17 +1176,6 @@ export default function (pi: ExtensionAPI) {
         } else {
           openaiModels.push(modelObj);
         }
-        if (spec.id === "deepseek-v4-flash") {
-          claudeModels.push({
-            ...modelObj,
-            compat: {
-              forceAdaptiveThinking: true,
-              allowEmptySignature: true,
-              sendSessionAffinityHeaders: true,
-              supportsEagerToolInputStreaming: false,
-            },
-          });
-        }
       }
     }
 
@@ -736,6 +1213,7 @@ export default function (pi: ExtensionAPI) {
     return newModels;
   }
 
+  cleanupDeepSeekDuplicates();
   const cachedPricing = loadCachedPricing();
   registerAgentRouterProviders(currentApiKey, cachedPricing);
 
@@ -762,13 +1240,19 @@ export default function (pi: ExtensionAPI) {
 
       const payload = event.payload;
       if (payload) {
+        const isDeepSeek = isDeepSeekRequest(event, ctx);
+
         if (payload.system !== undefined) {
           payload.system = enforceCanonicalRootPrompt(payload.system);
         }
-        if (Array.isArray(payload.messages) && payload.messages.length > 0) {
-          normalizeMessagesForAgentRouter(payload.messages);
 
-          const firstMsg = payload.messages[0];
+        applyPoisonRedaction(payload);
+
+        const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+        if (Array.isArray(messages) && messages.length > 0) {
+          normalizeMessagesForAgentRouter(messages, isDeepSeek);
+
+          const firstMsg = messages[0];
           if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
             firstMsg.role = "system";
             if (typeof firstMsg.content === "string") {
@@ -787,24 +1271,70 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event, ctx) => {
-    const model = ctx?.model;
-    if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
+    const message = (event as any)?.message;
+    if (!message) return;
+
+    if (message.role === "assistant" && message.stopReason !== "error") {
+      wafNotified = false;
+      isSensitiveBlock = false;
+    }
+
+    const provider = message.provider ?? ctx?.model?.provider;
+    const baseUrl = (message as any)?.baseUrl ?? (ctx?.model as any)?.baseUrl;
+    if (isAgentRouter(provider, baseUrl)) {
       setLastRequestEndTime(Date.now());
-      const msg = (event as any)?.message;
-      if (msg && msg.role === "assistant" && msg.stopReason === "error") {
-        checkAndNotifyContentBlocked(msg.errorMessage, ctx);
+    }
+
+    if (message.role !== "assistant" || message.stopReason !== "error") return;
+    if (!isAgentRouter(provider, baseUrl)) return;
+
+    const errorMessage = message.errorMessage ?? "";
+    if (!WAF_BLOCK_RE.test(errorMessage)) return;
+
+    escalatePending = true;
+    if (SENSITIVE_WORDS_RE.test(errorMessage)) {
+      isSensitiveBlock = true;
+    }
+
+    if (exhausted) {
+      if (!wafNotified) {
+        wafNotified = true;
+        const warning =
+          "AgentRouter content filter keeps blocking even with earlier messages hidden. " +
+          "Your latest message is likely the trigger — please rephrase or split it.";
+        if (ctx?.hasUI) {
+          ctx.ui.notify(warning, "warning");
+        } else {
+          console.warn(`\n⚠️  ${warning}\n`);
+        }
+      }
+      return;
+    }
+
+    if (!wafNotified) {
+      wafNotified = true;
+      const note = isSensitiveBlock
+        ? "Sensitive words detected in agent activity. Neutralizing previous leftovers so subsequent chats can proceed safely."
+        : "AgentRouter content filter blocked the request. Retrying automatically with earlier messages hidden.";
+      if (ctx?.hasUI) {
+        ctx.ui.notify(note, "warning");
+      } else {
+        console.warn(`\n⚠️  ${note}\n`);
       }
     }
+
+    return {
+      message: {
+        ...message,
+        errorMessage: `${errorMessage} (provider returned error — retrying with earlier messages hidden)`,
+      },
+    };
   });
 
-  pi.on("turn_end", async (event, ctx) => {
+  pi.on("turn_end", async (_event, ctx) => {
     const model = ctx?.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
       setLastRequestEndTime(Date.now());
-      const msg = (event as any)?.message;
-      if (msg && msg.role === "assistant" && msg.stopReason === "error") {
-        checkAndNotifyContentBlocked(msg.errorMessage, ctx);
-      }
     }
   });
 
@@ -817,6 +1347,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentApiKey = getEffectiveApiKey();
+    resetPoisonRedactionState();
+    cleanupDeepSeekDuplicates();
     updatePromptRewriteEnvForModel(ctx.model);
     setLastRequestEndTime(Date.now());
     syncEnabledModelsInSettings();
@@ -825,6 +1357,7 @@ export default function (pi: ExtensionAPI) {
       if (livePricing) {
         saveCachedPricing(livePricing);
         const newModels = registerAgentRouterProviders(currentApiKey, livePricing);
+        cleanupDeepSeekDuplicates();
         syncEnabledModelsInSettings();
         if (newModels.length > 0 && ctx.hasUI) {
           ctx.ui.notify(
@@ -1133,7 +1666,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.1.1]\n` +
+        `[AgentRouter Plugin v2.1.2]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
