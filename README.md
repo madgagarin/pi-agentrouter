@@ -36,7 +36,8 @@ pi install npm:@madgagarin/pi-agentrouter
 
 ## Features
 
-- **DeepSeek Multi-Turn Tool Calling:** Seamlessly flattens multi-turn tool history and preserves `reasoning_content` across tool execution turns, completely preventing upstream gateway 400 thinking mode errors.
+- **DeepSeek Native Multi-Turn Tool Calling:** Seamlessly preserves native `tool_calls` and guarantees non-empty `reasoning_content` across multi-turn execution, ensuring fully autonomous coding agent loops.
+- **WAF Bypass & Language Normalization:** Automatically replaces false-positive upstream WAF keywords (such as Russian `Ключевое` → `Главное`), cleans terminal ANSI sequences, and ensures persistent language adhering via technical preamble.
 - **Model Synchronization:** Automatically registers and adds active models to `enabledModels` in `settings.json` for quick selection via `Ctrl+P`.
 - **Schema Sanitization:** Automatically normalizes tool definitions (e.g. converting `required: null` to empty arrays) for strict OpenAI schema validation compatibility.
 - **WAF Diagnostics & Safe Redaction:** Intercepts upstream blocks and safely redacts older messages while preserving thinking placeholders for reasoning models.

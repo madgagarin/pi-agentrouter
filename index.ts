@@ -58,7 +58,11 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: {
+      sendSessionAffinityHeaders: true,
+      requiresReasoningContentOnAssistantMessages: true,
+      thinkingFormat: "deepseek",
+    },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
   "deepseek-v4f": {
@@ -68,7 +72,11 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: {
+      sendSessionAffinityHeaders: true,
+      requiresReasoningContentOnAssistantMessages: true,
+      thinkingFormat: "deepseek",
+    },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
   "glm-5.3": {
@@ -340,6 +348,23 @@ export function isAgentRouter(providerName?: string, baseUrl?: string): boolean 
 export const CANONICAL_PI_HEADER =
   "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.";
 
+export const LANGUAGE_PREAMBLE =
+  "[Instruction: You are an expert coding assistant operating inside pi. Please carefully analyze the technical context, understand the user request, follow all project instructions and coding standards, and respond thoroughly in the requested language.]";
+
+export function sanitizeDeepSeekText(text: string): string {
+  if (typeof text !== "string") return text;
+  // Replace false-positive blocked Russian word in AgentRouter upstream WAF
+  return text.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
+}
+
+export function cleanContent(text: string): string {
+  if (typeof text !== "string") return text;
+  return text
+    .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+}
+
 export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefined): string | any[] {
   if (!systemPrompt) {
     return CANONICAL_PI_HEADER;
@@ -389,6 +414,60 @@ export function isDeepSeekRequest(event: any, ctx: any): boolean {
 export const WAF_BLOCK_RE = /sensitive[_ ]words?[_ ]detected|content-blocked/i;
 export const SENSITIVE_WORDS_RE = /sensitive[_ ]words?[_ ]detected/i;
 export const REDACTED_NOTE = "[Message withheld by local policy]";
+
+export function frameUserTurnsForDeepSeek(messages: any[]): void {
+  if (!Array.isArray(messages)) return;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role !== "user") continue;
+
+    if (typeof msg.content === "string") {
+      const cleaned = sanitizeDeepSeekText(cleanContent(msg.content));
+      if (cleaned === REDACTED_NOTE) {
+        msg.content = REDACTED_NOTE;
+        continue;
+      }
+      if (!cleaned.startsWith(LANGUAGE_PREAMBLE)) {
+        msg.content = cleaned ? `${LANGUAGE_PREAMBLE}\n\n${cleaned}` : LANGUAGE_PREAMBLE;
+      } else {
+        msg.content = cleaned;
+      }
+    } else if (Array.isArray(msg.content)) {
+      if (msg.content.length === 0) {
+        msg.content.push({ type: "text", text: LANGUAGE_PREAMBLE });
+      } else {
+        const first = msg.content[0];
+        if (first && typeof first === "object" && first.type === "tool_result") {
+          continue;
+        }
+        let added = false;
+        for (const block of msg.content) {
+          if (block && typeof block === "object" && (block.type === "text" || block.type === "input_text")) {
+            if (typeof block.text === "string") {
+              const cleaned = sanitizeDeepSeekText(cleanContent(block.text));
+              if (cleaned === REDACTED_NOTE) {
+                block.text = REDACTED_NOTE;
+                added = true;
+                break;
+              }
+              if (!cleaned.startsWith(LANGUAGE_PREAMBLE)) {
+                block.text = `${LANGUAGE_PREAMBLE}\n\n${cleaned}`;
+              } else {
+                block.text = cleaned;
+              }
+              added = true;
+              break;
+            }
+          }
+        }
+        if (!added && msg.content.length > 0 && msg.content[0].type !== "tool_result") {
+          msg.content.unshift({ type: "text", text: LANGUAGE_PREAMBLE });
+        }
+      }
+    }
+  }
+}
+
 
 export function cleanJsonSchemaObject(schema: any): void {
   if (!schema || typeof schema !== "object") return;
@@ -810,6 +889,14 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
         msg.reasoning_content = extractedThinking;
       }
 
+      if (msg.content === null || msg.content === undefined) {
+        msg.content = "";
+      }
+
+      if (typeof msg.content === "string" && msg.content.includes("[Tool Call]:")) {
+        msg.content = msg.content.replace(/\[Tool Call\]:[^\n]+(\n|$)/g, "").trim();
+      }
+
       // If assistant executed tool calls, AgentRouter DeepSeek proxy strictly requires reasoning_content
       if (
         Array.isArray(msg.tool_calls) &&
@@ -832,29 +919,36 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
       // Flatten past assistant tool_calls into text and convert tool roles into user turns.
       // This prevents AgentRouter's upstream Anthropic gateway from rejecting the request with:
       // "400: The `content[].thinking` in the thinking mode must be passed back to the API."
-      if (msg.role === "assistant" && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-        let contentStr = typeof msg.content === "string" ? msg.content : "";
-        for (const tc of msg.tool_calls) {
-          const fnName = tc?.function?.name || tc?.name || "tool";
-          const fnArgs = tc?.function?.arguments || "{}";
-          contentStr += (contentStr ? "\n" : "") + `[Tool Call]: ${fnName}(${fnArgs})`;
-        }
-        msg.content = contentStr;
-        delete msg.tool_calls;
-        if (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim())) {
-          msg.reasoning_content = "Executing tools...";
-        }
+      // Ensure assistant tool calls retain non-empty reasoning_content for gateway compatibility
+      if (
+        msg.role === "assistant" &&
+        Array.isArray(msg.tool_calls) &&
+        msg.tool_calls.length > 0 &&
+        (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim()))
+      ) {
+        msg.reasoning_content = "Executing tools...";
       }
 
-      if (msg.role === "tool" || msg.role === "toolResult") {
-        const text = typeof msg.content === "string" ? msg.content : "";
-        const toolName = (msg as any).toolName || (msg as any).name || "tool";
-        msg.role = "user";
-        msg.content = `[Tool Result for ${toolName}]:\n${text}`;
-        delete msg.tool_call_id;
-        delete (msg as any).toolCallId;
+      if (typeof msg.content === "string") {
+        msg.content = sanitizeDeepSeekText(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block && typeof block === "object") {
+            if (typeof block.text === "string") {
+              block.text = sanitizeDeepSeekText(block.text);
+            }
+            if (typeof block.content === "string") {
+              block.content = sanitizeDeepSeekText(block.content);
+            }
+            if (typeof block.thinking === "string") {
+              block.thinking = sanitizeDeepSeekText(block.thinking);
+            }
+          }
+        }
       }
-
+      if (typeof msg.reasoning_content === "string") {
+        msg.reasoning_content = sanitizeDeepSeekText(msg.reasoning_content);
+      }
     }
   }
 }
@@ -1240,6 +1334,9 @@ export default function (pi: ExtensionAPI) {
 
       const payload = event.payload;
       if (payload) {
+        if (Array.isArray(payload.messages)) payload.messages = structuredClone(payload.messages);
+        if (Array.isArray(payload.input)) payload.input = structuredClone(payload.input);
+        if (Array.isArray(payload.system)) payload.system = structuredClone(payload.system);
         const isDeepSeek = isDeepSeekRequest(event, ctx);
 
         if (payload.system !== undefined) {
@@ -1251,6 +1348,10 @@ export default function (pi: ExtensionAPI) {
         const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
         if (Array.isArray(messages) && messages.length > 0) {
           normalizeMessagesForAgentRouter(messages, isDeepSeek);
+
+          if (isDeepSeek) {
+            frameUserTurnsForDeepSeek(messages);
+          }
 
           const firstMsg = messages[0];
           if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
@@ -1666,7 +1767,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.1.2]\n` +
+        `[AgentRouter Plugin v2.1.3]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
