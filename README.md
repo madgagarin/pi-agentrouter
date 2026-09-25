@@ -37,7 +37,9 @@ pi install npm:@madgagarin/pi-agentrouter
 ## Features
 
 - **DeepSeek Native Multi-Turn Tool Calling:** Seamlessly preserves native `tool_calls` and guarantees non-empty `reasoning_content` across multi-turn execution, ensuring fully autonomous coding agent loops.
+- **Compaction & Token Footprint Optimization:** Transparently intercepts `/compact` summarization requests at the transport level (`globalThis.fetch`), strips bulky thinking scratchpads and file dumps, compressing compaction payloads from ~1.65 MB down to ~200 KB.
 - **WAF Bypass & Language Normalization:** Automatically replaces false-positive upstream WAF keywords (such as Russian `Ключевое` → `Главное`), cleans terminal ANSI sequences, and ensures persistent language adhering via technical preamble.
+- **Gateway Auto-Retry & Fault Tolerance:** Automatic retry loop for transient upstream glitches (temporary 500, 503, or thinking mode channel hops) with diagnostic logging to `~/.pi/agent/.agentrouter-debug.log`.
 - **Model Synchronization:** Automatically registers and adds active models to `enabledModels` in `settings.json` for quick selection via `Ctrl+P`.
 - **Schema Sanitization:** Automatically normalizes tool definitions (e.g. converting `required: null` to empty arrays) for strict OpenAI schema validation compatibility.
 - **WAF Diagnostics & Safe Redaction:** Intercepts upstream blocks and safely redacts older messages while preserving thinking placeholders for reasoning models.
@@ -123,6 +125,9 @@ No. Request pacing only applies when talking to `agentrouter.org` endpoints. Loc
 
 #### Using custom subagents (`pi-subagents`)
 AgentRouter requires the base `pi-code` prompt signature for authentication. If you create custom subagents in `~/.pi/agent/agents/*.md`, make sure their frontmatter uses `systemPromptMode: append`.
+
+#### How does Gateway Resilience and Fault Tolerance work?
+Upstream LLM gateways can occasionally encounter transient channel hops or temporary thinking-mode validation errors (`400: in the thinking mode must be passed back`, `500 temporarily unavailable`, `503`). The extension includes a transparent transport-level interceptor (`installAgentRouterFetchHook`) on `globalThis.fetch` that sanitizes reasoning parameters, normalizes headers, and automatically retries transient errors with exponential backoff so your coding sessions continue uninterrupted. Diagnostic events are logged to `~/.pi/agent/.agentrouter-debug.log`.
 
 ---
 

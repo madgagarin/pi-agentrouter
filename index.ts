@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import * as fs from "fs";
 import * as path from "path";
+import * as os from "os";
 
 const CONFIG_FILE = path.join(process.env.HOME || "", ".pi/agent/agentrouter.json");
 const SETTINGS_FILE = path.join(process.env.HOME || "", ".pi/agent/settings.json");
@@ -61,7 +62,6 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     compat: {
       sendSessionAffinityHeaders: true,
       requiresReasoningContentOnAssistantMessages: true,
-      thinkingFormat: "deepseek",
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
@@ -75,7 +75,6 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     compat: {
       sendSessionAffinityHeaders: true,
       requiresReasoningContentOnAssistantMessages: true,
-      thinkingFormat: "deepseek",
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
@@ -350,6 +349,14 @@ export const CANONICAL_PI_HEADER =
 
 export const LANGUAGE_PREAMBLE =
   "[Instruction: You are an expert coding assistant operating inside pi. Please carefully analyze the technical context, understand the user request, follow all project instructions and coding standards, and respond thoroughly in the requested language.]";
+
+export function getPiUserAgent(): string {
+  try {
+    return `pi (${os.platform()} ${os.release()}; ${os.arch()})`;
+  } catch {
+    return "pi (browser)";
+  }
+}
 
 export function sanitizeDeepSeekText(text: string): string {
   if (typeof text !== "string") return text;
@@ -818,6 +825,171 @@ export function applyPoisonRedaction(payload: Record<string, unknown>): void {
   }
 }
 
+export function isCompactionPayload(payload: Record<string, unknown>): boolean {
+  if (
+    typeof payload.system === "string" &&
+    (payload.system.includes("summarization assistant") || payload.system.includes("context summarization"))
+  ) {
+    return true;
+  }
+
+  const messages = Array.isArray(payload.messages) ? payload.messages : (payload as any).input;
+  if (!Array.isArray(messages)) return false;
+
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const role = (m as any).role;
+    const content = (m as any).content;
+
+    if (role === "system" || role === "developer") {
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+          ? content.map((b: any) => b?.text || "").join(" ")
+          : "";
+      if (text.includes("summarization assistant") || text.includes("context summarization")) {
+        return true;
+      }
+    }
+
+    if (typeof content === "string") {
+      if (
+        (content.includes("<conversation>") && content.includes("</conversation>")) ||
+        (content.includes("# Conversation") && content.includes("# Instructions")) ||
+        content.includes("The messages above are a conversation to summarize") ||
+        content.includes("This is the PREFIX of a turn that was too large to keep")
+      ) {
+        return true;
+      }
+    } else if (Array.isArray(content)) {
+      for (const b of content) {
+        if (b && typeof b === "object" && typeof b.text === "string") {
+          if (
+            (b.text.includes("<conversation>") && b.text.includes("</conversation>")) ||
+            (b.text.includes("# Conversation") && b.text.includes("# Instructions")) ||
+            b.text.includes("The messages above are a conversation to summarize") ||
+            b.text.includes("This is the PREFIX of a turn that was too large to keep")
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+export function cleanSerializedConversation(inner: string): string {
+  // Split on block boundaries: [User]:, [Assistant thinking]:, [Assistant]:, [Assistant tool calls]:, [Tool result]:
+  const blockRegex = /(?:^|\n+)(?=\[(?:User|Assistant thinking|Assistant|Assistant tool calls|Tool result)\]:)/;
+  const blocks = inner.split(blockRegex);
+  const out: string[] = [];
+
+  for (const rawBlock of blocks) {
+    const block = rawBlock.trim();
+    if (!block) continue;
+
+    // 1. Drop thinking blocks completely — thinking is scratchpad, wastes tokens, and contains sensitive reasoning tokens
+    if (block.startsWith("[Assistant thinking]:")) {
+      continue;
+    }
+
+    // 2. Neutralize tool results — replace raw dumped files, scraped web pages, tokens, and diffs with clean placeholder
+    if (block.startsWith("[Tool result]:")) {
+      out.push("[Tool result]: [Content withheld by local policy]");
+      continue;
+    }
+
+    // 3. Neutralize tool call arguments — keep tool name and signature clean without massive payload dumps
+    if (block.startsWith("[Assistant tool calls]:")) {
+      const stripped = block.replace(/\([\s\S]*?\)(?=;\s*|$)/g, "()");
+      out.push(stripped);
+      continue;
+    }
+
+    // 4. Drop assistant messages that were WAF error dumps
+    if (block.startsWith("[Assistant]:")) {
+      if (WAF_BLOCK_RE.test(block)) {
+        continue;
+      }
+      out.push(block);
+      continue;
+    }
+
+    out.push(block);
+  }
+
+  let res = out.join("\n\n");
+  res = sanitizeDeepSeekText(res);
+  return res;
+}
+
+export function sanitizeCompactionText(text: string): string {
+  // Format 1: <conversation>...</conversation> (Standard compaction & branch summary)
+  if (text.includes("<conversation>")) {
+    text = text.replace(/<conversation>([\s\S]*?)<\/conversation>/g, (_m, inner) => {
+      return `<conversation>\n${cleanSerializedConversation(inner)}\n</conversation>`;
+    });
+  }
+
+  // Format 2: # Conversation ... # Instructions (Split-turn prefix summary)
+  if (text.includes("# Conversation")) {
+    text = text.replace(/# Conversation([\s\S]*?)(?=# Instructions|$)/g, (_m, inner) => {
+      return `# Conversation\n${cleanSerializedConversation(inner)}\n\n`;
+    });
+  }
+
+  // Format 3: Clean <previous-summary> if present
+  if (text.includes("<previous-summary>")) {
+    text = text.replace(/<previous-summary>([\s\S]*?)<\/previous-summary>/g, (_m, inner) => {
+      let cleaned = inner.replace(/Error: 500: \{"message":"sensitive words detected[\s\S]*?}/gi, "");
+      cleaned = cleaned.replace(/sensitive[_ ]words?[_ ]detected|content-blocked/gi, "");
+      cleaned = sanitizeDeepSeekText(cleaned);
+      return `<previous-summary>${cleaned}</previous-summary>`;
+    });
+  }
+
+  return text;
+}
+
+export function sanitizeCompactionPayload(payload: Record<string, unknown>): boolean {
+  const messages = Array.isArray(payload.messages) ? payload.messages : (payload as any).input;
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+
+  let sanitized = false;
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+
+    if (typeof msg.content === "string") {
+      if (
+        msg.content.includes("<conversation>") ||
+        msg.content.includes("# Conversation") ||
+        msg.content.includes("<previous-summary>")
+      ) {
+        msg.content = sanitizeCompactionText(msg.content);
+        sanitized = true;
+      }
+    } else if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block && typeof block === "object" && typeof block.text === "string") {
+          if (
+            block.text.includes("<conversation>") ||
+            block.text.includes("# Conversation") ||
+            block.text.includes("<previous-summary>")
+          ) {
+            block.text = sanitizeCompactionText(block.text);
+            sanitized = true;
+          }
+        }
+      }
+    }
+  }
+
+  return sanitized;
+}
+
 export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boolean = false): void {
   if (!Array.isArray(messages)) return;
 
@@ -916,9 +1088,6 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
     }
 
     if (isDeepSeek) {
-      // Flatten past assistant tool_calls into text and convert tool roles into user turns.
-      // This prevents AgentRouter's upstream Anthropic gateway from rejecting the request with:
-      // "400: The `content[].thinking` in the thinking mode must be passed back to the API."
       // Ensure assistant tool calls retain non-empty reasoning_content for gateway compatibility
       if (
         msg.role === "assistant" &&
@@ -1075,7 +1244,7 @@ export function checkAndNotifyContentBlocked(errMessage: string | undefined, ctx
 export async function fetchLivePricing(): Promise<ApiPricingModel[] | null> {
   try {
     const res = await fetch("https://agentrouter.org/api/pricing", {
-      
+      headers: { "User-Agent": getPiUserAgent() },
     });
     if (!res.ok) return null;
     const data = await res.json();
@@ -1099,7 +1268,8 @@ export async function fetchTokenUsage(apiKey: string): Promise<number | null> {
       {
         headers: {
           Authorization: `Bearer ${apiKey}`,
-          },
+          "User-Agent": getPiUserAgent(),
+        },
       }
     );
     if (!res.ok) return null;
@@ -1177,7 +1347,134 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
   }
 }
 
+function arDebugLog(msg: string): void {
+  try {
+    const logFile = path.join(process.env.HOME || "", ".pi/agent/.agentrouter-debug.log");
+    fs.appendFileSync(logFile, `[${new Date().toISOString()}] ${msg}\n`, "utf-8");
+  } catch {}
+}
+
+let fetchHookInstalled = false;
+
+export function installAgentRouterFetchHook(): void {
+  if (fetchHookInstalled) return;
+  fetchHookInstalled = true;
+  arDebugLog("installAgentRouterFetchHook successfully registered on globalThis.fetch");
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request)?.url || "";
+
+    if (urlStr.includes("agentrouter.org")) {
+      if (init?.headers) {
+        if (init.headers instanceof Headers) {
+          if (init.headers.get("User-Agent") === "pi-code") {
+            init.headers.set("User-Agent", getPiUserAgent());
+          }
+        } else if (typeof init.headers === "object") {
+          for (const [k, v] of Object.entries(init.headers)) {
+            if (k.toLowerCase() === "user-agent" && v === "pi-code") {
+              (init.headers as any)[k] = getPiUserAgent();
+            }
+          }
+        }
+      }
+
+      if (init && typeof init.body === "string") {
+        try {
+          const body = JSON.parse(init.body);
+          if (body && typeof body === "object") {
+            const modelId = typeof body.model === "string" ? body.model.toLowerCase() : "";
+            const isDeepSeek = modelId.includes("deepseek");
+            const isCompaction = isCompactionPayload(body);
+            const origLen = init.body.length;
+
+            if (isDeepSeek && "thinking" in body) {
+              delete body.thinking;
+            }
+
+            if (isCompaction) {
+              sanitizeCompactionPayload(body);
+              const messages = Array.isArray(body.messages) ? body.messages : body.input;
+              if (Array.isArray(messages) && messages.length > 0) {
+                normalizeMessagesForAgentRouter(messages, isDeepSeek);
+                if (isDeepSeek) {
+                  frameUserTurnsForDeepSeek(messages);
+                }
+              }
+              init.body = JSON.stringify(body);
+              arDebugLog(`[FetchHook] Compaction intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
+            } else {
+              applyPoisonRedaction(body);
+              const messages = Array.isArray(body.messages) ? body.messages : body.input;
+              if (Array.isArray(messages) && messages.length > 0) {
+                normalizeMessagesForAgentRouter(messages, isDeepSeek);
+                if (isDeepSeek) {
+                  frameUserTurnsForDeepSeek(messages);
+                }
+              }
+              init.body = JSON.stringify(body);
+              arDebugLog(`[FetchHook] Chat turn intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
+            }
+          }
+        } catch (err: any) {
+          arDebugLog(`[FetchHook] Error parsing body: ${err.message}`);
+        }
+      }
+    }
+
+    let response = await originalFetch.call(this, input, init);
+
+    // If upstream returns a retryable error on AgentRouter (such as thinking mode glitch or temporary unavailability), retry up to 2 times
+    if (urlStr.includes("agentrouter.org")) {
+      for (let attempt = 0; attempt < 2 && !response.ok; attempt++) {
+        const cloned = response.clone();
+        const text = await cloned.text();
+        const shouldRetry =
+          (response.status === 400 && text.includes("in the thinking mode must be passed back")) ||
+          (response.status === 500 && (text.includes("temporarily unavailable") || text.includes("sensitive words detected"))) ||
+          response.status === 503;
+
+        if (!shouldRetry) break;
+
+        arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 80)}. Retrying attempt ${attempt + 1}...`);
+        if (response.status === 400 && init && typeof init.body === "string") {
+          try {
+            const bodyObj = JSON.parse(init.body);
+            if (bodyObj && typeof bodyObj === "object") {
+              delete bodyObj.thinking;
+              init.body = JSON.stringify(bodyObj);
+            }
+          } catch {}
+        }
+        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 500));
+        response = await originalFetch.call(this, input, init);
+      }
+    }
+
+    // Log and handle non-OK responses from upstream
+    if (urlStr.includes("agentrouter.org") && !response.ok) {
+      try {
+        const cloned = response.clone();
+        const text = await cloned.text();
+        arDebugLog(`[FetchHook] Upstream ${response.status}: ${text.slice(0, 200)}`);
+        if (WAF_BLOCK_RE.test(text)) {
+          escalatePending = true;
+          if (SENSITIVE_WORDS_RE.test(text)) {
+            isSensitiveBlock = true;
+          }
+        }
+      } catch {}
+    }
+
+    return response;
+  };
+}
+
+installAgentRouterFetchHook();
+
 export default function (pi: ExtensionAPI) {
+  installAgentRouterFetchHook();
   function getEffectiveApiKey(): string {
     const cfg = loadConfig();
     return normalizeApiKey(process.env.AGENTROUTER_API_KEY || process.env.AGENT_ROUTER_API_KEY || cfg.apiKey || "");
@@ -1339,27 +1636,38 @@ export default function (pi: ExtensionAPI) {
         if (Array.isArray(payload.system)) payload.system = structuredClone(payload.system);
         const isDeepSeek = isDeepSeekRequest(event, ctx);
 
-        if (payload.system !== undefined) {
-          payload.system = enforceCanonicalRootPrompt(payload.system);
-        }
-
-        applyPoisonRedaction(payload);
-
-        const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
-        if (Array.isArray(messages) && messages.length > 0) {
-          normalizeMessagesForAgentRouter(messages, isDeepSeek);
-
-          if (isDeepSeek) {
-            frameUserTurnsForDeepSeek(messages);
+        if (isCompactionPayload(payload)) {
+          sanitizeCompactionPayload(payload);
+          const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+          if (Array.isArray(messages) && messages.length > 0) {
+            normalizeMessagesForAgentRouter(messages, isDeepSeek);
+            if (isDeepSeek) {
+              frameUserTurnsForDeepSeek(messages);
+            }
+          }
+        } else {
+          if (payload.system !== undefined) {
+            payload.system = enforceCanonicalRootPrompt(payload.system);
           }
 
-          const firstMsg = messages[0];
-          if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
-            firstMsg.role = "system";
-            if (typeof firstMsg.content === "string") {
-              firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
-            } else if (Array.isArray(firstMsg.content)) {
-              firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+          applyPoisonRedaction(payload);
+
+          const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+          if (Array.isArray(messages) && messages.length > 0) {
+            normalizeMessagesForAgentRouter(messages, isDeepSeek);
+
+            if (isDeepSeek) {
+              frameUserTurnsForDeepSeek(messages);
+            }
+
+            const firstMsg = messages[0];
+            if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
+              firstMsg.role = "system";
+              if (typeof firstMsg.content === "string") {
+                firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+              } else if (Array.isArray(firstMsg.content)) {
+                firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+              }
             }
           }
         }
@@ -1767,7 +2075,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.1.3]\n` +
+        `[AgentRouter Plugin v2.2.0]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
