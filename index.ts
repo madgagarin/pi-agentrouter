@@ -18,6 +18,8 @@ export interface ModelSpec {
   id: string;
   name: string;
   providerType: "openai" | "anthropic";
+  api?: string;
+  headers?: Record<string, string>;
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
@@ -46,10 +48,11 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     id: "gpt-6-astra",
     name: "gpt-6-astra",
     providerType: "openai",
+    api: "openai-responses",
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: { sendSessionAffinityHeaders: false },
     cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "deepseek-v4-flash": {
@@ -60,7 +63,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: {
-      sendSessionAffinityHeaders: true,
+      sendSessionAffinityHeaders: false,
       requiresReasoningContentOnAssistantMessages: true,
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
@@ -73,7 +76,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 65536,
     reasoning: true,
     compat: {
-      sendSessionAffinityHeaders: true,
+      sendSessionAffinityHeaders: false,
       requiresReasoningContentOnAssistantMessages: true,
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
@@ -85,7 +88,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: { sendSessionAffinityHeaders: false },
     cost: { input: 3.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "glm-5.2": {
@@ -95,7 +98,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: { sendSessionAffinityHeaders: false },
     cost: { input: 3.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "gpt-5.6-sol": {
@@ -105,7 +108,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: { sendSessionAffinityHeaders: false },
     cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "gpt-5.5": {
@@ -115,7 +118,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
-    compat: { sendSessionAffinityHeaders: true },
+    compat: { sendSessionAffinityHeaders: false },
     cost: { input: 4.0 / 1_000_000, output: 8.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "claude-opus-4-8": {
@@ -478,6 +481,8 @@ export function frameUserTurnsForDeepSeek(messages: any[]): void {
 
 export function cleanJsonSchemaObject(schema: any): void {
   if (!schema || typeof schema !== "object") return;
+
+  delete schema.$schema;
 
   if (schema.type === "object" || schema.properties) {
     if (schema.required === null || schema.required === undefined || !Array.isArray(schema.required)) {
@@ -1330,6 +1335,7 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
       return { model: modelId, status: "READY", code: res.status };
     }
 
+    const msg = await res.text().catch(() => "");
     if (
       res.status === 402 ||
       msg.toLowerCase().includes("quota") ||
@@ -1366,17 +1372,41 @@ export function installAgentRouterFetchHook(): void {
     const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request)?.url || "";
 
     if (urlStr.includes("agentrouter.org")) {
-      if (init?.headers) {
-        if (init.headers instanceof Headers) {
-          if (init.headers.get("User-Agent") === "pi-code") {
-            init.headers.set("User-Agent", getPiUserAgent());
-          }
-        } else if (typeof init.headers === "object") {
-          for (const [k, v] of Object.entries(init.headers)) {
-            if (k.toLowerCase() === "user-agent" && v === "pi-code") {
-              (init.headers as any)[k] = getPiUserAgent();
+      const piUa = getPiUserAgent();
+      if (!init) {
+        init = { headers: { "User-Agent": piUa } };
+      } else if (!init.headers) {
+        init.headers = { "User-Agent": piUa };
+      } else if (init.headers instanceof Headers) {
+        const currentUa = init.headers.get("User-Agent") || "";
+        if (!currentUa.startsWith("pi (") && !currentUa.startsWith("pi/")) {
+          init.headers.set("User-Agent", piUa);
+        }
+      } else if (Array.isArray(init.headers)) {
+        let found = false;
+        for (const pair of init.headers) {
+          if (pair[0].toLowerCase() === "user-agent") {
+            found = true;
+            if (!pair[1].startsWith("pi (") && !pair[1].startsWith("pi/")) {
+              pair[1] = piUa;
             }
           }
+        }
+        if (!found) {
+          init.headers.push(["User-Agent", piUa]);
+        }
+      } else if (typeof init.headers === "object") {
+        let foundUa = false;
+        for (const [k, v] of Object.entries(init.headers)) {
+          if (k.toLowerCase() === "user-agent") {
+            foundUa = true;
+            if (typeof v !== "string" || (!v.startsWith("pi (") && !v.startsWith("pi/"))) {
+              (init.headers as any)[k] = piUa;
+            }
+          }
+        }
+        if (!foundUa) {
+          (init.headers as any)["User-Agent"] = piUa;
         }
       }
 
@@ -1386,6 +1416,7 @@ export function installAgentRouterFetchHook(): void {
           if (body && typeof body === "object") {
             const modelId = typeof body.model === "string" ? body.model.toLowerCase() : "";
             const isDeepSeek = modelId.includes("deepseek");
+            const isResponsesEndpoint = urlStr.includes("/responses");
             const isCompaction = isCompactionPayload(body);
             const origLen = init.body.length;
 
@@ -1404,7 +1435,7 @@ export function installAgentRouterFetchHook(): void {
               }
               init.body = JSON.stringify(body);
               arDebugLog(`[FetchHook] Compaction intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
-            } else {
+            } else if (!isResponsesEndpoint) {
               applyPoisonRedaction(body);
               const messages = Array.isArray(body.messages) ? body.messages : body.input;
               if (Array.isArray(messages) && messages.length > 0) {
@@ -1415,6 +1446,12 @@ export function installAgentRouterFetchHook(): void {
               }
               init.body = JSON.stringify(body);
               arDebugLog(`[FetchHook] Chat turn intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
+            } else {
+              if (Array.isArray(body.tools) && body.tools.length > 0) {
+                sanitizeOpenAiTools(body.tools);
+              }
+              init.body = JSON.stringify(body);
+              arDebugLog(`[FetchHook] Responses turn intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
             }
           }
         } catch (err: any) {
@@ -1425,29 +1462,111 @@ export function installAgentRouterFetchHook(): void {
 
     let response = await originalFetch.call(this, input, init);
 
-    // If upstream returns a retryable error on AgentRouter (such as thinking mode glitch or temporary unavailability), retry up to 2 times
+    // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, or temporary unavailability), retry up to 4 times
     if (urlStr.includes("agentrouter.org")) {
-      for (let attempt = 0; attempt < 2 && !response.ok; attempt++) {
+      for (let attempt = 0; attempt < 4 && !response.ok; attempt++) {
         const cloned = response.clone();
         const text = await cloned.text();
+        const lowerText = text.toLowerCase();
+
+        const isRateLimit =
+          response.status === 429 ||
+          lowerText.includes("rate limit") ||
+          lowerText.includes("rate_limit") ||
+          lowerText.includes("exceeded token rate limit") ||
+          lowerText.includes("rate limit reached") ||
+          lowerText.includes("tokens per minute") ||
+          lowerText.includes("tpm") ||
+          lowerText.includes("rpm");
+
         const shouldRetry =
-          (response.status === 400 && text.includes("in the thinking mode must be passed back")) ||
+          isRateLimit ||
+          (response.status === 400 && (text.includes("in the thinking mode must be passed back") || text.includes("content[].thinking"))) ||
           (response.status === 500 && (text.includes("temporarily unavailable") || text.includes("sensitive words detected"))) ||
           response.status === 503;
 
         if (!shouldRetry) break;
 
-        arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 80)}. Retrying attempt ${attempt + 1}...`);
+        arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 100)}. Retrying attempt ${attempt + 1}...`);
+
+        // Break sticky routing to failing replica/region (e.g. eastus2) by rotating request ID and affinity
+        if (init?.headers) {
+          const hopId = `${Date.now()}-${attempt + 1}-${Math.random().toString(36).slice(2, 7)}`;
+          if (init.headers instanceof Headers) {
+            init.headers.set("x-client-request-id", hopId);
+            if (isRateLimit) {
+              init.headers.set("x-session-affinity", `hop-${hopId}`);
+              init.headers.set("session_id", `hop-${hopId}`);
+            } else {
+              const currentAffinity = init.headers.get("x-session-affinity");
+              if (currentAffinity) {
+                init.headers.set("x-session-affinity", `${currentAffinity}-hop${attempt + 1}`);
+              }
+              const currentSession = init.headers.get("session_id");
+              if (currentSession) {
+                init.headers.set("session_id", `${currentSession}-hop${attempt + 1}`);
+              }
+            }
+          } else if (typeof init.headers === "object") {
+            (init.headers as any)["x-client-request-id"] = hopId;
+            if (isRateLimit) {
+              (init.headers as any)["x-session-affinity"] = `hop-${hopId}`;
+              (init.headers as any)["session_id"] = `hop-${hopId}`;
+            } else {
+              for (const [k, v] of Object.entries(init.headers)) {
+                const lower = k.toLowerCase();
+                if (lower === "x-session-affinity" || lower === "session_id") {
+                  (init.headers as any)[k] = `${v}-hop${attempt + 1}`;
+                }
+              }
+            }
+          }
+        }
+
         if (response.status === 400 && init && typeof init.body === "string") {
           try {
             const bodyObj = JSON.parse(init.body);
             if (bodyObj && typeof bodyObj === "object") {
               delete bodyObj.thinking;
+              const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : bodyObj.input;
+              if (Array.isArray(msgs)) {
+                for (const m of msgs) {
+                  if (m && typeof m === "object" && m.role === "assistant") {
+                    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                      if (!m.reasoning_content || (typeof m.reasoning_content === "string" && !m.reasoning_content.trim())) {
+                        m.reasoning_content = "Executing tools...";
+                      }
+                      if (m.content === null || m.content === undefined || m.content === "") {
+                        m.content = "Executing tools...";
+                      }
+                    }
+                  }
+                }
+              }
               init.body = JSON.stringify(bodyObj);
             }
           } catch {}
         }
-        await new Promise((resolve) => setTimeout(resolve, (attempt + 1) * 500));
+
+        let waitMs = (attempt + 1) * 600;
+        if (isRateLimit) {
+          const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
+          const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
+          if (retryAfterMs > 0) {
+            waitMs = Math.min(retryAfterMs, 8000);
+          } else if (retryAfterSec > 0) {
+            waitMs = Math.min(retryAfterSec * 1000, 8000);
+          } else {
+            const match = text.match(/retry after (\d+) seconds?/i);
+            if (match) {
+              waitMs = Math.min(parseInt(match[1], 10) * 1000, 8000);
+            } else {
+              waitMs = (attempt + 1) * 1500;
+            }
+          }
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
         response = await originalFetch.call(this, input, init);
       }
     }
@@ -1504,7 +1623,7 @@ export default function (pi: ExtensionAPI) {
         const outCost = (item.model_ratio * item.completion_ratio * 2.0) / 1_000_000;
 
         if (spec) {
-          const modelObj = {
+          const modelObj: any = {
             id: spec.id,
             name: spec.name,
             reasoning: spec.reasoning,
@@ -1514,6 +1633,12 @@ export default function (pi: ExtensionAPI) {
             cost: { input: inCost, output: outCost, cacheRead: 0, cacheWrite: 0 },
             compat: spec.compat || { sendSessionAffinityHeaders: true },
           };
+          if (spec.api) {
+            modelObj.api = spec.api;
+          }
+          if (spec.headers) {
+            modelObj.headers = { ...spec.headers };
+          }
           if (spec.providerType === "anthropic") {
             claudeModels.push(modelObj);
           } else {
@@ -1552,7 +1677,7 @@ export default function (pi: ExtensionAPI) {
 
     for (const [id, spec] of Object.entries(KNOWN_MODEL_SPECS)) {
       if (!processed.has(id)) {
-        const modelObj = {
+        const modelObj: any = {
           id: spec.id,
           name: spec.name,
           reasoning: spec.reasoning,
@@ -1562,6 +1687,12 @@ export default function (pi: ExtensionAPI) {
           cost: spec.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
           compat: spec.compat || { sendSessionAffinityHeaders: true },
         };
+        if (spec.api) {
+          modelObj.api = spec.api;
+        }
+        if (spec.headers) {
+          modelObj.headers = { ...spec.headers };
+        }
         if (spec.providerType === "anthropic") {
           claudeModels.push(modelObj);
         } else {
@@ -1582,7 +1713,7 @@ export default function (pi: ExtensionAPI) {
       apiKey,
       api: "openai-completions",
       compat: {
-        sendSessionAffinityHeaders: true,
+        sendSessionAffinityHeaders: false,
       },
       models: openaiModels,
     });
@@ -2075,7 +2206,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.2.0]\n` +
+        `[AgentRouter Plugin v2.2.1]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
