@@ -64,7 +64,6 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     reasoning: true,
     compat: {
       sendSessionAffinityHeaders: false,
-      requiresReasoningContentOnAssistantMessages: true,
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
@@ -77,7 +76,6 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     reasoning: true,
     compat: {
       sendSessionAffinityHeaders: false,
-      requiresReasoningContentOnAssistantMessages: true,
     },
     cost: { input: 4.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 2.0 / 1_000_000, cacheWrite: 0 },
   },
@@ -361,14 +359,53 @@ export function getPiUserAgent(): string {
   }
 }
 
+export function isBinaryDump(text: string): boolean {
+  if (typeof text !== "string" || text.length === 0) return false;
+  if (text.includes("\x7fELF") || text.includes("ELF\x02\x01")) return true;
+  if (text.includes("\x00\x00")) return true;
+
+  const sampleLen = Math.min(text.length, 2000);
+  let nonPrintable = 0;
+  for (let i = 0; i < sampleLen; i++) {
+    const code = text.charCodeAt(i);
+    if (code === 0 || code === 0xfffd || (code < 32 && code !== 9 && code !== 10 && code !== 13)) {
+      nonPrintable++;
+    }
+  }
+  if (nonPrintable > 15) return true;
+
+  // Unbroken string tokens (minified binary dumps, strings binary dumps without whitespace)
+  if (text.length > 600) {
+    const tokens = text.split(/[\s\r\n\t]+/);
+    for (const t of tokens) {
+      if (t.length > 600) return true;
+    }
+  }
+
+  // Large strings (>8KB) with extremely low whitespace density (< 1.5%)
+  if (text.length > 8000) {
+    let ws = 0;
+    const checkLen = Math.min(text.length, 20000);
+    for (let i = 0; i < checkLen; i++) {
+      const code = text.charCodeAt(i);
+      if (code === 32 || code === 10 || code === 13 || code === 9) ws++;
+    }
+    if (ws / checkLen < 0.015) return true;
+  }
+
+  return false;
+}
+
 export function sanitizeDeepSeekText(text: string): string {
   if (typeof text !== "string") return text;
+  if (isBinaryDump(text)) return REDACTED_NOTE;
   // Replace false-positive blocked Russian word in AgentRouter upstream WAF
   return text.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
 }
 
 export function cleanContent(text: string): string {
   if (typeof text !== "string") return text;
+  if (isBinaryDump(text)) return "[Binary output omitted]";
   return text
     .replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, "")
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
@@ -414,16 +451,16 @@ export function enforceCanonicalRootPrompt(systemPrompt: string | any[] | undefi
 
 export function isDeepSeekRequest(event: any, ctx: any): boolean {
   const modelId = (
+    (event as any)?.payload?.model ||
     (event as any)?.model?.id ||
     (ctx as any)?.model?.id ||
-    (event as any)?.payload?.model ||
     ""
   ).toLowerCase();
   return modelId.includes("deepseek");
 }
 export const WAF_BLOCK_RE = /sensitive[_ ]words?[_ ]detected|content-blocked/i;
-export const SENSITIVE_WORDS_RE = /sensitive[_ ]words?[_ ]detected/i;
-export const REDACTED_NOTE = "[Message withheld by local policy]";
+export const SENSITIVE_WORDS_RE = /sensitive[_ ]words?[_ ]detected|content-blocked/i;
+export const REDACTED_NOTE = "[Output omitted]";
 
 export function frameUserTurnsForDeepSeek(messages: any[]): void {
   if (!Array.isArray(messages)) return;
@@ -528,6 +565,7 @@ export let isSensitiveBlock = false;
 export let exhausted = false;
 export let sessionAnchor: string | null = null;
 export let wafNotified = false;
+export let lastWafBlockTime = 0;
 
 export function resetPoisonRedactionState(): void {
   redactSet.clear();
@@ -536,11 +574,15 @@ export function resetPoisonRedactionState(): void {
   exhausted = false;
   sessionAnchor = null;
   wafNotified = false;
+  lastWafBlockTime = 0;
 }
 
 export function triggerEscalation(sensitive: boolean = false): void {
   escalatePending = true;
   isSensitiveBlock = sensitive;
+  if (sensitive) {
+    lastWafBlockTime = Date.now();
+  }
 }
 
 
@@ -594,10 +636,10 @@ export function lastHumanUserIndex(messages: unknown[]): number {
 export function hasRedactableText(content: unknown, msg?: Record<string, unknown>): boolean {
   if (msg) {
     if (msg.details && (typeof msg.details === "string" || Object.keys(msg.details).length > 0)) return true;
-    if (typeof (msg as any).reasoning_content === "string" && (msg as any).reasoning_content.length > 0) return true;
-    if (typeof (msg as any).thinking === "string" && (msg as any).thinking.length > 0) return true;
+    if (typeof (msg as any).reasoning_content === "string" && (msg as any).reasoning_content.trim().length > 0) return true;
+    if (typeof (msg as any).thinking === "string" && (msg as any).thinking.trim().length > 0) return true;
   }
-  if (msg?.type === "function_call") return typeof (msg as any).arguments === "string" && (msg as any).arguments !== "{}";
+  if (msg?.type === "function_call") return false;
   if (msg?.type === "function_call_output") return hasRedactableText((msg as any).output);
   if (typeof content === "string") return content.length > 0 && content !== REDACTED_NOTE;
   if (Array.isArray(content)) {
@@ -614,19 +656,6 @@ export function hasRedactableText(content: unknown, msg?: Record<string, unknown
             }
           }
         }
-      }
-      if (b.type === "tool_use" && isRecord(b.input) && Object.keys(b.input).length > 0) {
-        return true;
-      }
-      if (b.type === "toolCall" && isRecord(b.arguments) && Object.keys(b.arguments).length > 0) {
-        return true;
-      }
-    }
-  }
-  if (msg && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-    for (const tc of msg.tool_calls) {
-      if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === "string" && tc.function.arguments !== "{}") {
-        return true;
       }
     }
   }
@@ -663,10 +692,6 @@ export function redactBlocks(content: unknown): void {
           }
         }
       }
-    } else if (block.type === "tool_use") {
-      block.input = {};
-    } else if (block.type === "toolCall") {
-      block.arguments = {};
     }
   }
 }
@@ -674,10 +699,8 @@ export function redactBlocks(content: unknown): void {
 export function isHideable(msg: Record<string, unknown>): boolean {
   return (
     msg.role === "user" ||
-    msg.role === "assistant" ||
     msg.role === "tool" ||
     msg.role === "toolResult" ||
-    msg.type === "function_call" ||
     msg.type === "function_call_output"
   );
 }
@@ -697,29 +720,22 @@ export function redactMessageAt(messages: unknown[], i: number): void {
     (msg as any).thinking = "Thinking...";
   }
 
-  if (msg.type === "function_call") {
-    (msg as any).arguments = "{}";
-    return;
-  }
   if (msg.type === "function_call_output") {
     if (typeof (msg as any).output === "string") (msg as any).output = REDACTED_NOTE;
     else redactBlocks((msg as any).output);
     return;
   }
-  if (typeof msg.content === "string") {
+  if (msg.role === "tool" || msg.role === "toolResult") {
     msg.content = REDACTED_NOTE;
-  } else if (Array.isArray(msg.content)) {
-    redactBlocks(msg.content);
-    if (msg.content.length === 0 && !Array.isArray(msg.tool_calls)) {
-      msg.content = [{ type: "text", text: REDACTED_NOTE }];
-    }
-  } else if (msg.role === "tool" || msg.role === "toolResult" || msg.role === "assistant") {
-    msg.content = REDACTED_NOTE;
+    return;
   }
-  if (Array.isArray(msg.tool_calls)) {
-    for (const tc of msg.tool_calls) {
-      if (isRecord(tc) && isRecord(tc.function) && typeof tc.function.arguments === "string") {
-        tc.function.arguments = "{}";
+  if (msg.role === "user") {
+    if (typeof msg.content === "string") {
+      msg.content = REDACTED_NOTE;
+    } else if (Array.isArray(msg.content)) {
+      redactBlocks(msg.content);
+      if (msg.content.length === 0) {
+        msg.content = [{ type: "text", text: REDACTED_NOTE }];
       }
     }
   }
@@ -746,15 +762,16 @@ export function applyPoisonRedaction(payload: Record<string, unknown>): void {
 
   const anchor = firstUserAnchor(messages);
   if (anchor !== sessionAnchor) {
-    const firstContact = sessionAnchor === null;
     sessionAnchor = anchor;
-    if (!firstContact) {
-      redactSet.clear();
-      escalatePending = false;
-      isSensitiveBlock = false;
-      exhausted = false;
-      wafNotified = false;
+    for (const fp of redactSet) {
+      if (!fps.includes(fp)) {
+        redactSet.delete(fp);
+      }
     }
+    escalatePending = false;
+    isSensitiveBlock = false;
+    exhausted = false;
+    wafNotified = false;
   }
 
   if (redactSet.size > 0 && !fps.some((fp) => fp && redactSet.has(fp))) {
@@ -775,15 +792,58 @@ export function applyPoisonRedaction(payload: Record<string, unknown>): void {
     isSensitiveBlock = false;
 
     if (sensitive) {
-      // Sensitive words detected: neutralize ALL turns (older user, tool, assistant, active tool results) except active human user
+      // Sensitive words / content-blocked detected:
+      // 1. Immediately sweep and redact ANY binary dumps anywhere in history
       for (let i = 0; i < messages.length; i++) {
-        if (i === lastHumanUser) continue;
         if (!isRecord(messages[i])) continue;
         const m = messages[i] as Record<string, unknown>;
-        if (!isHideable(m)) continue;
-        redactSet.add(fps[i]);
-        if (hasRedactableText(m.content, m)) {
+        let hasBinary = false;
+        if (typeof m.content === "string" && isBinaryDump(m.content)) hasBinary = true;
+        if (Array.isArray(m.content)) {
+          for (const b of m.content) {
+            if (isRecord(b)) {
+              if (typeof b.text === "string" && isBinaryDump(b.text)) hasBinary = true;
+              if (typeof b.content === "string" && isBinaryDump(b.content)) hasBinary = true;
+            }
+          }
+        }
+        if (hasBinary && isHideable(m)) {
+          redactSet.add(fps[i]);
           redactMessageAt(messages, i);
+        }
+      }
+
+      // 2. Neutralize the most recent tool result(s) searching backwards
+      let toolsRedactedCount = 0;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (!isRecord(messages[i])) continue;
+        const m = messages[i] as Record<string, unknown>;
+        const isToolMsg =
+          m.role === "tool" ||
+          m.role === "toolResult" ||
+          m.type === "function_call_output" ||
+          (m.role === "user" && Array.isArray(m.content) && m.content.some((b) => isRecord(b) && b.type === "tool_result"));
+
+        if (isToolMsg && !redactSet.has(fps[i]) && hasRedactableText(m.content, m)) {
+          redactSet.add(fps[i]);
+          redactMessageAt(messages, i);
+          toolsRedactedCount++;
+          if (toolsRedactedCount >= 2) break;
+        }
+      }
+      // If no tool turns were left to redact, redact older user turns one by one (searching backwards, excluding lastHumanUser)
+      if (!anyToolsRedacted) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (i === lastHumanUser) continue;
+          if (!isRecord(messages[i])) continue;
+          const m = messages[i] as Record<string, unknown>;
+          if (m.role !== "user" || !isHideable(m)) continue;
+          if (redactSet.has(fps[i])) continue;
+          redactSet.add(fps[i]);
+          if (hasRedactableText(m.content, m)) {
+            redactMessageAt(messages, i);
+            break;
+          }
         }
       }
     } else {
@@ -1016,11 +1076,12 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
           msg.content.every((b: any) => b && typeof b === "object" && (b.type === "text" || b.type === "input_text") && (!b.text || b.text.trim() === ""))
         ));
 
+      const hasValidRc = typeof msg.reasoning_content === "string" && msg.reasoning_content.trim().length > 0;
       if (
         msg.stopReason === "error" ||
         (msg.stopReason === "aborted" && isEmptyContent) ||
         (typeof msg.content === "string" && WAF_BLOCK_RE.test(msg.content)) ||
-        (isEmptyContent && !hasTools && !msg.reasoning_content)
+        (isEmptyContent && !hasTools && !hasValidRc)
       ) {
         messages.splice(i, 1);
       }
@@ -1036,16 +1097,46 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
     if (msg.role === "assistant") {
       let extractedThinking: string | undefined;
 
+      const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
+      const hasContentToolCalls =
+        Array.isArray(msg.content) &&
+        msg.content.some(
+          (b: any) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use" || b.type === "function_call")
+        );
+      const isToolTurn = hasToolCalls || hasContentToolCalls;
+
+      let textContent = "";
+
       if (Array.isArray(msg.content)) {
         const thinkingParts: string[] = [];
         const nonThinkingParts: any[] = [];
+        const convertedToolCalls: any[] = [];
 
         for (const part of msg.content) {
-          if (part && typeof part === "object" && (part.type === "thinking" || part.type === "reasoning")) {
-            const text = part.thinking || part.text;
-            if (text) thinkingParts.push(text);
+          if (part && typeof part === "object") {
+            if (part.type === "thinking" || part.type === "reasoning") {
+              const text = typeof part.thinking === "string" ? part.thinking.trim() : typeof part.text === "string" ? part.text.trim() : "";
+              if (text.length > 0) thinkingParts.push(text);
+            } else if (part.type === "toolCall" || part.type === "tool_use" || part.type === "function_call") {
+              convertedToolCalls.push({
+                id: part.id || part.tool_call_id || `call_${Math.random().toString(36).slice(2, 9)}`,
+                type: "function",
+                function: {
+                  name: part.name || part.function?.name || "tool",
+                  arguments: typeof part.arguments === "string" ? part.arguments : JSON.stringify(part.arguments ?? {}),
+                },
+              });
+            } else {
+              nonThinkingParts.push(part);
+            }
           } else {
             nonThinkingParts.push(part);
+          }
+        }
+
+        if (convertedToolCalls.length > 0) {
+          if (!Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0) {
+            msg.tool_calls = convertedToolCalls;
           }
         }
 
@@ -1053,56 +1144,42 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
           extractedThinking = thinkingParts.join("\n");
         }
 
-        if (nonThinkingParts.length === 0) {
-          msg.content = "";
-        } else if (nonThinkingParts.length === 1 && nonThinkingParts[0].type === "text") {
-          msg.content = nonThinkingParts[0].text;
-        } else {
-          msg.content = nonThinkingParts;
+        if (nonThinkingParts.length === 1 && nonThinkingParts[0].type === "text") {
+          textContent = nonThinkingParts[0].text || "";
+        } else if (nonThinkingParts.length > 0) {
+          textContent = nonThinkingParts
+            .map((p) => (typeof p === "string" ? p : p?.text || ""))
+            .filter(Boolean)
+            .join("\n");
         }
+      } else if (typeof msg.content === "string") {
+        textContent = msg.content;
       }
 
-      if (extractedThinking && !msg.reasoning_content) {
-        msg.reasoning_content = extractedThinking;
+      const hadRc = typeof msg.reasoning_content === "string";
+      const hasValidRc = hadRc && msg.reasoning_content.trim().length > 0;
+      const validRc = hasValidRc ? msg.reasoning_content.trim() : undefined;
+      const validExtracted = typeof extractedThinking === "string" && extractedThinking.trim().length > 0 ? extractedThinking.trim() : undefined;
+      const fallbackReasoning = isToolTurn ? "Executing tools..." : (hadRc && isDeepSeek ? "Thinking..." : undefined);
+      const reasoning = validRc || validExtracted || fallbackReasoning;
+
+      if (reasoning) {
+        msg.reasoning_content = reasoning;
+      } else {
+        delete msg.reasoning_content;
       }
 
-      if (msg.content === null || msg.content === undefined) {
-        msg.content = "";
+      if (textContent && textContent.includes("[Tool Call]:")) {
+        textContent = textContent.replace(/\[Tool Call\]:[^\n]+(\n|$)/g, "").trim();
       }
 
-      if (typeof msg.content === "string" && msg.content.includes("[Tool Call]:")) {
-        msg.content = msg.content.replace(/\[Tool Call\]:[^\n]+(\n|$)/g, "").trim();
-      }
-
-      // If assistant executed tool calls, AgentRouter DeepSeek proxy strictly requires reasoning_content
-      if (
-        Array.isArray(msg.tool_calls) &&
-        msg.tool_calls.length > 0 &&
-        (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim()))
-      ) {
-        msg.reasoning_content = "Executing tools...";
-      }
-
-      // If DeepSeek model and content is still empty without tool calls, provide fallback text
-      if (isDeepSeek && (!msg.content || msg.content === "") && (!Array.isArray(msg.tool_calls) || msg.tool_calls.length === 0)) {
+      msg.content = textContent;
+      if (isDeepSeek && (!msg.content || msg.content.trim() === "") && !isToolTurn) {
         msg.content = "[Interrupted]";
-        if (!msg.reasoning_content) {
-          msg.reasoning_content = "Interrupted response";
-        }
       }
     }
 
     if (isDeepSeek) {
-      // Ensure assistant tool calls retain non-empty reasoning_content for gateway compatibility
-      if (
-        msg.role === "assistant" &&
-        Array.isArray(msg.tool_calls) &&
-        msg.tool_calls.length > 0 &&
-        (!msg.reasoning_content || (typeof msg.reasoning_content === "string" && !msg.reasoning_content.trim()))
-      ) {
-        msg.reasoning_content = "Executing tools...";
-      }
-
       if (typeof msg.content === "string") {
         msg.content = sanitizeDeepSeekText(msg.content);
       } else if (Array.isArray(msg.content)) {
@@ -1113,6 +1190,12 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
             }
             if (typeof block.content === "string") {
               block.content = sanitizeDeepSeekText(block.content);
+            } else if (Array.isArray(block.content)) {
+              for (const sub of block.content) {
+                if (sub && typeof sub === "object" && typeof sub.text === "string") {
+                  sub.text = sanitizeDeepSeekText(sub.text);
+                }
+              }
             }
             if (typeof block.thinking === "string") {
               block.thinking = sanitizeDeepSeekText(block.thinking);
@@ -1120,8 +1203,29 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
           }
         }
       }
-      if (typeof msg.reasoning_content === "string") {
-        msg.reasoning_content = sanitizeDeepSeekText(msg.reasoning_content);
+      if (Array.isArray(msg.tool_calls)) {
+        for (const tc of msg.tool_calls) {
+          if (tc?.function && typeof tc.function.arguments === "string") {
+            tc.function.arguments = sanitizeDeepSeekText(tc.function.arguments);
+          }
+        }
+      }
+      if (msg.role === "assistant") {
+        const hasTools = (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0);
+        if (msg.reasoning_content && typeof msg.reasoning_content === "string") {
+          msg.reasoning_content = sanitizeDeepSeekText(msg.reasoning_content).trim();
+          if (msg.reasoning_content.length === 0) {
+            if (hasTools) {
+              msg.reasoning_content = "Executing tools...";
+            } else {
+              msg.reasoning_content = "Thinking...";
+            }
+          }
+        } else if (hasTools) {
+          msg.reasoning_content = "Executing tools...";
+        } else {
+          delete msg.reasoning_content;
+        }
       }
     }
   }
@@ -1360,6 +1464,158 @@ function arDebugLog(msg: string): void {
   } catch {}
 }
 
+export let lastAgentRouterCookie = "";
+export let activeAgentRouterThinkingFormat: "openai" | "claude" = "openai";
+
+export function getActiveAgentRouterThinkingFormat(): "openai" | "claude" {
+  return "openai";
+}
+
+export function setActiveAgentRouterThinkingFormat(_format: "openai" | "claude"): void {
+  activeAgentRouterThinkingFormat = "openai";
+}
+
+export function getLastAgentRouterCookie(): string {
+  return lastAgentRouterCookie;
+}
+
+export function setLastAgentRouterCookie(cookie: string): void {
+  lastAgentRouterCookie = cookie;
+}
+
+export function extractCookieFromResponse(res: Response): string | null {
+  try {
+    const rawSetCookie = res.headers.get("set-cookie");
+    if (rawSetCookie) {
+      const match = rawSetCookie.match(/(acw_tc=[^;]+)/i);
+      if (match) {
+        return match[1];
+      }
+    }
+  } catch {}
+  return null;
+}
+
+export function attachCookieToHeaders(headers: unknown, cookieStr: string): void {
+  if (!headers || !cookieStr) return;
+  if (headers instanceof Headers) {
+    const existing = headers.get("cookie");
+    if (!existing) {
+      headers.set("cookie", cookieStr);
+    } else if (!existing.includes(cookieStr.split("=")[0])) {
+      headers.set("cookie", `${existing}; ${cookieStr}`);
+    }
+    return;
+  }
+  if (Array.isArray(headers)) {
+    let found = false;
+    for (const pair of headers) {
+      if (typeof pair[0] === "string" && pair[0].toLowerCase() === "cookie") {
+        found = true;
+        if (!pair[1].includes(cookieStr.split("=")[0])) {
+          pair[1] = `${pair[1]}; ${cookieStr}`;
+        }
+        break;
+      }
+    }
+    if (!found) {
+      headers.push(["Cookie", cookieStr]);
+    }
+    return;
+  }
+  if (typeof headers === "object") {
+    let found = false;
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === "cookie") {
+        found = true;
+        if (typeof v === "string" && !v.includes(cookieStr.split("=")[0])) {
+          (headers as any)[k] = `${v}; ${cookieStr}`;
+        }
+        break;
+      }
+    }
+    if (!found) {
+      (headers as any)["Cookie"] = cookieStr;
+    }
+  }
+}
+
+export function getHeader(headers: unknown, name: string): string | undefined {
+  if (!headers) return undefined;
+  const target = name.toLowerCase();
+  if (headers instanceof Headers) {
+    return headers.get(target) || undefined;
+  }
+  if (Array.isArray(headers)) {
+    for (const [k, v] of headers) {
+      if (typeof k === "string" && k.toLowerCase() === target) {
+        return typeof v === "string" ? v : String(v);
+      }
+    }
+    return undefined;
+  }
+  if (typeof headers === "object") {
+    for (const [k, v] of Object.entries(headers)) {
+      if (k.toLowerCase() === target) {
+        return typeof v === "string" ? v : String(v);
+      }
+    }
+  }
+  return undefined;
+}
+
+export function setHeader(headers: unknown, name: string, value: string): void {
+  if (!headers) return;
+  const target = name.toLowerCase();
+  if (headers instanceof Headers) {
+    headers.set(name, value);
+    return;
+  }
+  if (Array.isArray(headers)) {
+    for (let i = 0; i < headers.length; i++) {
+      if (typeof headers[i][0] === "string" && headers[i][0].toLowerCase() === target) {
+        headers[i][1] = value;
+        return;
+      }
+    }
+    headers.push([name, value]);
+    return;
+  }
+  if (typeof headers === "object") {
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === target) {
+        (headers as Record<string, any>)[k] = value;
+        return;
+      }
+    }
+    (headers as Record<string, any>)[name] = value;
+  }
+}
+
+export function removeHeader(headers: unknown, name: string): void {
+  if (!headers) return;
+  const target = name.toLowerCase();
+  if (headers instanceof Headers) {
+    headers.delete(name);
+    return;
+  }
+  if (Array.isArray(headers)) {
+    for (let i = headers.length - 1; i >= 0; i--) {
+      if (typeof headers[i][0] === "string" && headers[i][0].toLowerCase() === target) {
+        headers.splice(i, 1);
+      }
+    }
+    return;
+  }
+  if (typeof headers === "object") {
+    for (const k of Object.keys(headers)) {
+      if (k.toLowerCase() === target) {
+        delete (headers as Record<string, any>)[k];
+      }
+    }
+  }
+}
+
 let fetchHookInstalled = false;
 
 export function installAgentRouterFetchHook(): void {
@@ -1445,6 +1701,9 @@ export function installAgentRouterFetchHook(): void {
                 }
               }
               init.body = JSON.stringify(body);
+              if (isDeepSeek && (init.body.includes("Ключевое") || init.body.includes("ключевое"))) {
+                init.body = init.body.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
+              }
               arDebugLog(`[FetchHook] Chat turn intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
             } else {
               if (Array.isArray(body.tools) && body.tools.length > 0) {
@@ -1462,9 +1721,16 @@ export function installAgentRouterFetchHook(): void {
 
     let response = await originalFetch.call(this, input, init);
 
-    // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, or temporary unavailability), retry up to 4 times
     if (urlStr.includes("agentrouter.org")) {
-      for (let attempt = 0; attempt < 4 && !response.ok; attempt++) {
+      const respCookie = extractCookieFromResponse(response);
+      if (respCookie) {
+        lastAgentRouterCookie = respCookie;
+      }
+    }
+
+    // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, or temporary unavailability), retry up to 6 times
+    if (urlStr.includes("agentrouter.org")) {
+      for (let attempt = 0; attempt < 10 && !response.ok; attempt++) {
         const cloned = response.clone();
         const text = await cloned.text();
         const lowerText = text.toLowerCase();
@@ -1479,77 +1745,80 @@ export function installAgentRouterFetchHook(): void {
           lowerText.includes("tpm") ||
           lowerText.includes("rpm");
 
-        const shouldRetry =
-          isRateLimit ||
-          (response.status === 400 && (text.includes("in the thinking mode must be passed back") || text.includes("content[].thinking"))) ||
-          (response.status === 500 && (text.includes("temporarily unavailable") || text.includes("sensitive words detected"))) ||
-          response.status === 503;
+        const isThinking400 =
+          response.status === 400 &&
+          (text.includes("in the thinking mode must be passed back") ||
+            text.includes("content[].thinking") ||
+            text.includes("reasoning_content"));
+
+        const isDeserialize422 =
+          response.status === 422 ||
+          lowerText.includes("failed to deserialize") ||
+          lowerText.includes("unknown variant") ||
+          lowerText.includes("expected one of `text`");
+
+        const isWafBlock =
+          (response.status === 500 && (text.includes("sensitive words detected") || text.includes("sensitive_words_detected"))) ||
+          (response.status === 400 && (text.includes("content-blocked") || text.includes("sensitive words detected") || text.includes("sensitive_words_detected")));
+
+        const isWafChallenge405 =
+          response.status === 405 ||
+          (response.status === 400 && lowerText.includes("blocked") && !isThinking400 && !isWafBlock);
+
+        const isServiceUnavailable =
+          (response.status === 500 && text.includes("temporarily unavailable")) ||
+          response.status === 502 ||
+          response.status === 503 ||
+          response.status === 504;
+
+        const shouldRetry = isRateLimit || isThinking400 || isDeserialize422 || isWafBlock || isWafChallenge405 || isServiceUnavailable;
 
         if (!shouldRetry) break;
 
         arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 100)}. Retrying attempt ${attempt + 1}...`);
 
-        // Break sticky routing to failing replica/region (e.g. eastus2) by rotating request ID and affinity
+        lastAgentRouterCookie = "";
         if (init?.headers) {
-          const hopId = `${Date.now()}-${attempt + 1}-${Math.random().toString(36).slice(2, 7)}`;
-          if (init.headers instanceof Headers) {
-            init.headers.set("x-client-request-id", hopId);
-            if (isRateLimit) {
-              init.headers.set("x-session-affinity", `hop-${hopId}`);
-              init.headers.set("session_id", `hop-${hopId}`);
-            } else {
-              const currentAffinity = init.headers.get("x-session-affinity");
-              if (currentAffinity) {
-                init.headers.set("x-session-affinity", `${currentAffinity}-hop${attempt + 1}`);
-              }
-              const currentSession = init.headers.get("session_id");
-              if (currentSession) {
-                init.headers.set("session_id", `${currentSession}-hop${attempt + 1}`);
-              }
-            }
-          } else if (typeof init.headers === "object") {
-            (init.headers as any)["x-client-request-id"] = hopId;
-            if (isRateLimit) {
-              (init.headers as any)["x-session-affinity"] = `hop-${hopId}`;
-              (init.headers as any)["session_id"] = `hop-${hopId}`;
-            } else {
-              for (const [k, v] of Object.entries(init.headers)) {
-                const lower = k.toLowerCase();
-                if (lower === "x-session-affinity" || lower === "session_id") {
-                  (init.headers as any)[k] = `${v}-hop${attempt + 1}`;
-                }
-              }
-            }
-          }
+          removeHeader(init.headers, "cookie");
+          removeHeader(init.headers, "x-session-affinity");
+          removeHeader(init.headers, "session_id");
+          removeHeader(init.headers, "x-client-request-id");
         }
 
-        if (response.status === 400 && init && typeof init.body === "string") {
+        // Clean payload if it contained problematic structures (e.g. body.thinking or WAF poison)
+        if (init && typeof init.body === "string") {
           try {
             const bodyObj = JSON.parse(init.body);
             if (bodyObj && typeof bodyObj === "object") {
-              delete bodyObj.thinking;
+              const modelId = typeof bodyObj.model === "string" ? bodyObj.model.toLowerCase() : "";
+              const isDeepSeekModel = modelId.includes("deepseek");
+              if (isDeepSeekModel && "thinking" in bodyObj) {
+                delete bodyObj.thinking;
+              }
               const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : bodyObj.input;
               if (Array.isArray(msgs)) {
-                for (const m of msgs) {
-                  if (m && typeof m === "object" && m.role === "assistant") {
-                    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-                      if (!m.reasoning_content || (typeof m.reasoning_content === "string" && !m.reasoning_content.trim())) {
-                        m.reasoning_content = "Executing tools...";
-                      }
-                      if (m.content === null || m.content === undefined || m.content === "") {
-                        m.content = "Executing tools...";
-                      }
-                    }
-                  }
+                if (isWafBlock) {
+                  lastWafBlockTime = Date.now();
+                  triggerEscalation(true);
+                  applyPoisonRedaction(bodyObj);
+                }
+                normalizeMessagesForAgentRouter(msgs, isDeepSeekModel);
+                if (isDeepSeekModel) {
+                  frameUserTurnsForDeepSeek(msgs);
                 }
               }
               init.body = JSON.stringify(bodyObj);
+              if (isDeepSeekModel && (init.body.includes("Ключевое") || init.body.includes("ключевое"))) {
+                init.body = init.body.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
+              }
             }
           } catch {}
         }
 
-        let waitMs = (attempt + 1) * 600;
-        if (isRateLimit) {
+        let waitMs = Math.max(minIntervalMs, 1500) + Math.floor(Math.random() * 600) + attempt * 200;
+        if (isWafChallenge405) {
+          waitMs = Math.max(minIntervalMs, 2500) + attempt * 500 + Math.floor(Math.random() * 500);
+        } else if (isRateLimit) {
           const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
           const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
           if (retryAfterMs > 0) {
@@ -1567,7 +1836,15 @@ export function installAgentRouterFetchHook(): void {
         }
 
         await new Promise((resolve) => setTimeout(resolve, waitMs));
+        setLastRequestEndTime(Date.now());
         response = await originalFetch.call(this, input, init);
+      }
+    }
+
+    if (urlStr.includes("agentrouter.org")) {
+      const okCookie = extractCookieFromResponse(response);
+      if (okCookie) {
+        lastAgentRouterCookie = okCookie;
       }
     }
 
@@ -1578,6 +1855,7 @@ export function installAgentRouterFetchHook(): void {
         const text = await cloned.text();
         arDebugLog(`[FetchHook] Upstream ${response.status}: ${text.slice(0, 200)}`);
         if (WAF_BLOCK_RE.test(text)) {
+          lastWafBlockTime = Date.now();
           escalatePending = true;
           if (SENSITIVE_WORDS_RE.test(text)) {
             isSensitiveBlock = true;
@@ -1748,10 +2026,27 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("before_provider_request", async (event, ctx) => {
-    const provider = ((event as any)?.model?.provider || ctx?.model?.provider || "").toLowerCase();
-    const baseUrl = (event as any)?.model?.baseUrl || (ctx?.model as any)?.baseUrl || "";
+    const payload = event.payload;
+    const provider = (
+      (payload as any)?.provider ||
+      (event as any)?.model?.provider ||
+      ctx?.model?.provider ||
+      ""
+    ).toLowerCase();
+    const baseUrl = (
+      (payload as any)?.baseUrl ||
+      (event as any)?.model?.baseUrl ||
+      (ctx?.model as any)?.baseUrl ||
+      ""
+    );
+    const modelId = (
+      (payload as any)?.model ||
+      (event as any)?.model?.id ||
+      ctx?.model?.id ||
+      ""
+    ).toLowerCase();
 
-    if (isAgentRouter(provider, baseUrl)) {
+    if (isAgentRouter(provider, baseUrl) || modelId.includes("deepseek") || modelId.includes("gpt-6-astra") || modelId.includes("gpt-5.6-sol") || modelId.includes("claude-opus-5")) {
       const lastEnd = getLastRequestEndTime();
       const now = Date.now();
       const elapsed = now - lastEnd;
@@ -1760,7 +2055,6 @@ export default function (pi: ExtensionAPI) {
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
 
-      const payload = event.payload;
       if (payload) {
         if (Array.isArray(payload.messages)) payload.messages = structuredClone(payload.messages);
         if (Array.isArray(payload.input)) payload.input = structuredClone(payload.input);
@@ -1807,7 +2101,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
     }
-    return undefined;
+    return payload;
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -1829,10 +2123,11 @@ export default function (pi: ExtensionAPI) {
     if (!isAgentRouter(provider, baseUrl)) return;
 
     const errorMessage = message.errorMessage ?? "";
-    if (!WAF_BLOCK_RE.test(errorMessage)) return;
+    const isRecentWaf = Date.now() - lastWafBlockTime < 15000;
+    if (!WAF_BLOCK_RE.test(errorMessage) && !isRecentWaf) return;
 
     escalatePending = true;
-    if (SENSITIVE_WORDS_RE.test(errorMessage)) {
+    if (SENSITIVE_WORDS_RE.test(errorMessage) || isRecentWaf) {
       isSensitiveBlock = true;
     }
 
@@ -2206,7 +2501,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.2.1]\n` +
+        `[AgentRouter Plugin v2.3.0]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
