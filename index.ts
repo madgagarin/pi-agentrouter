@@ -376,7 +376,7 @@ export function isBinaryDump(text: string): boolean {
 
   // Unbroken string tokens (minified binary dumps, strings binary dumps without whitespace)
   if (text.length > 600) {
-    const tokens = text.split(/[\s\r\n\t]+/);
+    const tokens = text.split(/(?:\\n|\\r|[\s\r\n\t])+/);
     for (const t of tokens) {
       if (t.length > 600) return true;
     }
@@ -389,11 +389,151 @@ export function isBinaryDump(text: string): boolean {
     for (let i = 0; i < checkLen; i++) {
       const code = text.charCodeAt(i);
       if (code === 32 || code === 10 || code === 13 || code === 9) ws++;
+      else if (code === 92 && i + 1 < checkLen && (text.charCodeAt(i + 1) === 110 || text.charCodeAt(i + 1) === 114)) {
+        ws++;
+      }
     }
     if (ws / checkLen < 0.015) return true;
   }
 
   return false;
+}
+
+export function sanitizeToolCallArguments(args: string): string {
+  if (typeof args !== "string") {
+    return JSON.stringify(args ?? {});
+  }
+  // Homophone / false-positive Russian WAF replacements
+  let sanitized = args.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
+  // Tool call arguments MUST be valid JSON (never replace with REDACTED_NOTE)
+  try {
+    JSON.parse(sanitized);
+    return sanitized;
+  } catch {
+    return JSON.stringify({ raw: sanitized });
+  }
+}
+
+export function enforceToolCallPairing(messages: any[]): void {
+  if (!Array.isArray(messages)) return;
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") continue;
+
+    // Case 1: OpenAI tool result message (role === "tool")
+    if (msg.role === "tool") {
+      const toolCallId = msg.tool_call_id;
+      let prevAssistant: any = null;
+      for (let j = i - 1; j >= 0; j--) {
+        if (messages[j]?.role === "tool") continue;
+        if (messages[j]?.role === "assistant") {
+          prevAssistant = messages[j];
+        }
+        break;
+      }
+
+      if (prevAssistant) {
+        if (!Array.isArray(prevAssistant.tool_calls)) {
+          prevAssistant.tool_calls = [];
+        }
+        for (const tc of prevAssistant.tool_calls) {
+          if (tc?.function && typeof tc.function.arguments === "string") {
+            tc.function.arguments = sanitizeToolCallArguments(tc.function.arguments);
+          }
+        }
+        const hasMatchingToolCall = prevAssistant.tool_calls.some(
+          (tc: any) => tc && (tc.id === toolCallId || (!toolCallId && tc.id))
+        );
+        if (!hasMatchingToolCall && toolCallId) {
+          prevAssistant.tool_calls.push({
+            id: toolCallId,
+            type: "function",
+            function: {
+              name: msg.name || "tool",
+              arguments: "{}",
+            },
+          });
+        }
+      } else {
+        // Orphaned tool message with no preceding assistant turn: convert to safe plain user message
+        msg.role = "user";
+        if (msg.content === REDACTED_NOTE) {
+          msg.content = REDACTED_NOTE;
+        } else {
+          const contentStr = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
+          msg.content = `[Tool Result ${toolCallId || ""}]: ${contentStr}`;
+        }
+        delete msg.tool_call_id;
+        delete msg.name;
+      }
+    }
+
+    // Case 2: Anthropic tool result blocks inside user message ({ type: "tool_result" })
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const hasToolResult = msg.content.some((b: any) => b && typeof b === "object" && b.type === "tool_result");
+      if (hasToolResult) {
+        let prevAssistant: any = null;
+        for (let j = i - 1; j >= 0; j--) {
+          if (messages[j]?.role === "assistant") {
+            prevAssistant = messages[j];
+          }
+          break;
+        }
+
+        for (let bIdx = 0; bIdx < msg.content.length; bIdx++) {
+          const block = msg.content[bIdx];
+          if (block && typeof block === "object" && block.type === "tool_result") {
+            const toolUseId = block.tool_use_id;
+            if (prevAssistant) {
+              const inContent =
+                Array.isArray(prevAssistant.content) &&
+                prevAssistant.content.some(
+                  (b: any) => b && typeof b === "object" && (b.type === "tool_use" || b.type === "toolCall") && b.id === toolUseId
+                );
+              const inToolCalls =
+                Array.isArray(prevAssistant.tool_calls) &&
+                prevAssistant.tool_calls.some((tc: any) => tc && tc.id === toolUseId);
+
+              if (!inContent && !inToolCalls && toolUseId) {
+                if (!Array.isArray(prevAssistant.content)) {
+                  prevAssistant.content = prevAssistant.content ? [{ type: "text", text: String(prevAssistant.content) }] : [];
+                }
+                prevAssistant.content.push({
+                  type: "tool_use",
+                  id: toolUseId,
+                  name: "tool",
+                  input: {},
+                });
+                if (!Array.isArray(prevAssistant.tool_calls)) {
+                  prevAssistant.tool_calls = [];
+                }
+                prevAssistant.tool_calls.push({
+                  id: toolUseId,
+                  type: "function",
+                  function: { name: "tool", arguments: "{}" },
+                });
+              }
+            } else {
+              // Orphaned tool_result block with no preceding assistant turn: convert to plain text block
+              if (block.content === REDACTED_NOTE || (Array.isArray(block.content) && block.content[0]?.text === REDACTED_NOTE)) {
+                msg.content[bIdx] = {
+                  type: "text",
+                  text: REDACTED_NOTE,
+                };
+              } else {
+                const contentStr = typeof block.content === "string" ? block.content : JSON.stringify(block.content ?? "");
+                msg.content[bIdx] = {
+                  type: "text",
+                  text: `[Tool Result ${toolUseId || ""}]: ${contentStr}`,
+                };
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 export function sanitizeDeepSeekText(text: string): string {
@@ -566,6 +706,13 @@ export let exhausted = false;
 export let sessionAnchor: string | null = null;
 export let wafNotified = false;
 export let lastWafBlockTime = 0;
+export let activeMinIntervalMs = 3500;
+try {
+  const cfg = loadConfig();
+  if (typeof cfg.minIntervalMs === "number" && cfg.minIntervalMs >= 0) {
+    activeMinIntervalMs = cfg.minIntervalMs;
+  }
+} catch {}
 
 export function resetPoisonRedactionState(): void {
   redactSet.clear();
@@ -587,10 +734,19 @@ export function triggerEscalation(sensitive: boolean = false): void {
 
 
 export function fingerprintOf(msg: Record<string, unknown>): string {
-  const tc = Array.isArray(msg.tool_calls) ? JSON.stringify(msg.tool_calls).slice(0, 80) : "";
+  if (msg.tool_call_id && typeof msg.tool_call_id === "string") {
+    return `tool:${msg.tool_call_id}`;
+  }
   if (msg.type === "function_call" || msg.type === "function_call_output") {
     return `${msg.type}:${(msg as any).call_id}:${JSON.stringify((msg as any).arguments ?? (msg as any).output ?? "").slice(0, 160)}`;
   }
+  if (msg.role === "user" && Array.isArray(msg.content)) {
+    const tr = msg.content.find((b) => isRecord(b) && b.type === "tool_result" && typeof (b as any).tool_use_id === "string");
+    if (tr) {
+      return `tool_result:${(tr as any).tool_use_id}`;
+    }
+  }
+  const tc = Array.isArray(msg.tool_calls) ? JSON.stringify(msg.tool_calls).slice(0, 80) : "";
   return `${msg.role ?? msg.type}:${JSON.stringify(msg.content ?? "").slice(0, 160)}:${tc}`;
 }
 
@@ -768,8 +924,6 @@ export function applyPoisonRedaction(payload: Record<string, unknown>): void {
         redactSet.delete(fp);
       }
     }
-    escalatePending = false;
-    isSensitiveBlock = false;
     exhausted = false;
     wafNotified = false;
   }
@@ -828,11 +982,11 @@ export function applyPoisonRedaction(payload: Record<string, unknown>): void {
           redactSet.add(fps[i]);
           redactMessageAt(messages, i);
           toolsRedactedCount++;
-          if (toolsRedactedCount >= 2) break;
+          if (toolsRedactedCount >= 4) break;
         }
       }
       // If no tool turns were left to redact, redact older user turns one by one (searching backwards, excluding lastHumanUser)
-      if (!anyToolsRedacted) {
+      if (toolsRedactedCount === 0) {
         for (let i = messages.length - 1; i >= 0; i--) {
           if (i === lastHumanUser) continue;
           if (!isRecord(messages[i])) continue;
@@ -1088,6 +1242,8 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
     }
   }
 
+  enforceToolCallPairing(messages);
+
 
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
@@ -1206,7 +1362,7 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
       if (Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
           if (tc?.function && typeof tc.function.arguments === "string") {
-            tc.function.arguments = sanitizeDeepSeekText(tc.function.arguments);
+            tc.function.arguments = sanitizeToolCallArguments(tc.function.arguments);
           }
         }
       }
@@ -1229,6 +1385,8 @@ export function normalizeMessagesForAgentRouter(messages: any[], isDeepSeek: boo
       }
     }
   }
+
+  enforceToolCallPairing(messages);
 }
 
 export function cleanupDeepSeekDuplicates(): {
@@ -1731,113 +1889,124 @@ export function installAgentRouterFetchHook(): void {
     // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, or temporary unavailability), retry up to 6 times
     if (urlStr.includes("agentrouter.org")) {
       for (let attempt = 0; attempt < 10 && !response.ok; attempt++) {
-        const cloned = response.clone();
-        const text = await cloned.text();
-        const lowerText = text.toLowerCase();
+        try {
+          const cloned = response.clone();
+          const text = await cloned.text();
+          const lowerText = text.toLowerCase();
 
-        const isRateLimit =
-          response.status === 429 ||
-          lowerText.includes("rate limit") ||
-          lowerText.includes("rate_limit") ||
-          lowerText.includes("exceeded token rate limit") ||
-          lowerText.includes("rate limit reached") ||
-          lowerText.includes("tokens per minute") ||
-          lowerText.includes("tpm") ||
-          lowerText.includes("rpm");
+          const isRateLimit =
+            response.status === 429 ||
+            lowerText.includes("rate limit") ||
+            lowerText.includes("rate_limit") ||
+            lowerText.includes("exceeded token rate limit") ||
+            lowerText.includes("rate limit reached") ||
+            lowerText.includes("tokens per minute") ||
+            lowerText.includes("tpm") ||
+            lowerText.includes("rpm");
 
-        const isThinking400 =
-          response.status === 400 &&
-          (text.includes("in the thinking mode must be passed back") ||
-            text.includes("content[].thinking") ||
-            text.includes("reasoning_content"));
+          const isThinking400 =
+            response.status === 400 &&
+            (text.includes("in the thinking mode must be passed back") ||
+              text.includes("content[].thinking") ||
+              text.includes("reasoning_content"));
 
-        const isDeserialize422 =
-          response.status === 422 ||
-          lowerText.includes("failed to deserialize") ||
-          lowerText.includes("unknown variant") ||
-          lowerText.includes("expected one of `text`");
+          const isDeserialize422 =
+            response.status === 422 ||
+            lowerText.includes("failed to deserialize") ||
+            lowerText.includes("unknown variant") ||
+            lowerText.includes("expected one of `text`");
 
-        const isWafBlock =
-          (response.status === 500 && (text.includes("sensitive words detected") || text.includes("sensitive_words_detected"))) ||
-          (response.status === 400 && (text.includes("content-blocked") || text.includes("sensitive words detected") || text.includes("sensitive_words_detected")));
+          const isWafBlock =
+            (response.status === 500 && (text.includes("sensitive words detected") || text.includes("sensitive_words_detected"))) ||
+            (response.status === 400 && (text.includes("content-blocked") || text.includes("sensitive words detected") || text.includes("sensitive_words_detected")));
 
-        const isWafChallenge405 =
-          response.status === 405 ||
-          (response.status === 400 && lowerText.includes("blocked") && !isThinking400 && !isWafBlock);
+          const isWafChallenge405 =
+            response.status === 405 ||
+            (response.status === 400 && lowerText.includes("blocked") && !isThinking400 && !isWafBlock);
 
-        const isServiceUnavailable =
-          (response.status === 500 && text.includes("temporarily unavailable")) ||
-          response.status === 502 ||
-          response.status === 503 ||
-          response.status === 504;
+          const isServiceUnavailable =
+            (response.status === 500 && text.includes("temporarily unavailable")) ||
+            response.status === 502 ||
+            response.status === 503 ||
+            response.status === 504;
 
-        const shouldRetry = isRateLimit || isThinking400 || isDeserialize422 || isWafBlock || isWafChallenge405 || isServiceUnavailable;
+          const isToolPairing400 =
+            response.status === 400 &&
+            (lowerText.includes("tool_result block must have a corresponding tool_use block") ||
+              (lowerText.includes("unexpected") && lowerText.includes("tool_use_id")) ||
+              (lowerText.includes("tool_result") && lowerText.includes("tool_use")));
 
-        if (!shouldRetry) break;
+          const shouldRetry = isRateLimit || isThinking400 || isDeserialize422 || isWafBlock || isWafChallenge405 || isServiceUnavailable || isToolPairing400;
 
-        arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 100)}. Retrying attempt ${attempt + 1}...`);
+          if (!shouldRetry) break;
 
-        lastAgentRouterCookie = "";
-        if (init?.headers) {
-          removeHeader(init.headers, "cookie");
-          removeHeader(init.headers, "x-session-affinity");
-          removeHeader(init.headers, "session_id");
-          removeHeader(init.headers, "x-client-request-id");
-        }
+          arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 100)}. Retrying attempt ${attempt + 1}...`);
 
-        // Clean payload if it contained problematic structures (e.g. body.thinking or WAF poison)
-        if (init && typeof init.body === "string") {
-          try {
-            const bodyObj = JSON.parse(init.body);
-            if (bodyObj && typeof bodyObj === "object") {
-              const modelId = typeof bodyObj.model === "string" ? bodyObj.model.toLowerCase() : "";
-              const isDeepSeekModel = modelId.includes("deepseek");
-              if (isDeepSeekModel && "thinking" in bodyObj) {
-                delete bodyObj.thinking;
-              }
-              const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : bodyObj.input;
-              if (Array.isArray(msgs)) {
-                if (isWafBlock) {
-                  lastWafBlockTime = Date.now();
-                  triggerEscalation(true);
-                  applyPoisonRedaction(bodyObj);
+          lastAgentRouterCookie = "";
+          if (init?.headers) {
+            removeHeader(init.headers, "cookie");
+            removeHeader(init.headers, "x-session-affinity");
+            removeHeader(init.headers, "session_id");
+            removeHeader(init.headers, "x-client-request-id");
+          }
+
+          // Clean payload if it contained problematic structures (e.g. body.thinking or WAF poison)
+          if (init && typeof init.body === "string") {
+            try {
+              const bodyObj = JSON.parse(init.body);
+              if (bodyObj && typeof bodyObj === "object") {
+                const modelId = typeof bodyObj.model === "string" ? bodyObj.model.toLowerCase() : "";
+                const isDeepSeekModel = modelId.includes("deepseek");
+                if (isDeepSeekModel && "thinking" in bodyObj) {
+                  delete bodyObj.thinking;
                 }
-                normalizeMessagesForAgentRouter(msgs, isDeepSeekModel);
-                if (isDeepSeekModel) {
-                  frameUserTurnsForDeepSeek(msgs);
+                const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : bodyObj.input;
+                if (Array.isArray(msgs)) {
+                  if (isWafBlock) {
+                    lastWafBlockTime = Date.now();
+                    triggerEscalation(true);
+                    applyPoisonRedaction(bodyObj);
+                  }
+                  normalizeMessagesForAgentRouter(msgs, isDeepSeekModel);
+                  if (isDeepSeekModel) {
+                    frameUserTurnsForDeepSeek(msgs);
+                  }
+                }
+                init.body = JSON.stringify(bodyObj);
+                if (isDeepSeekModel && (init.body.includes("Ключевое") || init.body.includes("ключевое"))) {
+                  init.body = init.body.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
                 }
               }
-              init.body = JSON.stringify(bodyObj);
-              if (isDeepSeekModel && (init.body.includes("Ключевое") || init.body.includes("ключевое"))) {
-                init.body = init.body.replace(/Ключевое/g, "Главное").replace(/ключевое/g, "главное");
-              }
-            }
-          } catch {}
-        }
+            } catch {}
+          }
 
-        let waitMs = Math.max(minIntervalMs, 1500) + Math.floor(Math.random() * 600) + attempt * 200;
-        if (isWafChallenge405) {
-          waitMs = Math.max(minIntervalMs, 2500) + attempt * 500 + Math.floor(Math.random() * 500);
-        } else if (isRateLimit) {
-          const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
-          const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
-          if (retryAfterMs > 0) {
-            waitMs = Math.min(retryAfterMs, 8000);
-          } else if (retryAfterSec > 0) {
-            waitMs = Math.min(retryAfterSec * 1000, 8000);
-          } else {
-            const match = text.match(/retry after (\d+) seconds?/i);
-            if (match) {
-              waitMs = Math.min(parseInt(match[1], 10) * 1000, 8000);
+          let waitMs = Math.max(activeMinIntervalMs, 1500) + Math.floor(Math.random() * 600) + attempt * 200;
+          if (isWafChallenge405) {
+            waitMs = Math.max(activeMinIntervalMs, 2500) + attempt * 500 + Math.floor(Math.random() * 500);
+          } else if (isRateLimit) {
+            const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
+            const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
+            if (retryAfterMs > 0) {
+              waitMs = Math.min(retryAfterMs, 8000);
+            } else if (retryAfterSec > 0) {
+              waitMs = Math.min(retryAfterSec * 1000, 8000);
             } else {
-              waitMs = (attempt + 1) * 1500;
+              const match = text.match(/retry after (\d+) seconds?/i);
+              if (match) {
+                waitMs = Math.min(parseInt(match[1], 10) * 1000, 8000);
+              } else {
+                waitMs = (attempt + 1) * 1500;
+              }
             }
           }
-        }
 
-        await new Promise((resolve) => setTimeout(resolve, waitMs));
-        setLastRequestEndTime(Date.now());
-        response = await originalFetch.call(this, input, init);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          setLastRequestEndTime(Date.now());
+          response = await originalFetch.call(this, input, init);
+        } catch (err: any) {
+          arDebugLog(`[FetchHook] Retry loop error: ${err?.message || err}`);
+          break;
+        }
       }
     }
 
@@ -1880,6 +2049,7 @@ export default function (pi: ExtensionAPI) {
   const initialConfig = loadConfig();
   let currentApiKey = getEffectiveApiKey();
   let minIntervalMs = initialConfig.minIntervalMs ?? 3500;
+  activeMinIntervalMs = minIntervalMs;
 
   function buildModelsFromPricing(apiPricing: ApiPricingModel[] | null): {
     openaiModels: any[];
@@ -2386,6 +2556,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         minIntervalMs = val;
+        activeMinIntervalMs = val;
         saveConfig({ apiKey: currentApiKey, minIntervalMs });
         ctx.ui.notify(`Pacing interval set to ${minIntervalMs} ms.`, "info");
         return;
@@ -2501,7 +2672,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.3.0]\n` +
+        `[AgentRouter Plugin v2.3.1]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
