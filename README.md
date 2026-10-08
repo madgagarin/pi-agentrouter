@@ -19,7 +19,7 @@ Pi Coding Agent extension for [AgentRouter](https://agentrouter.org). Adds suppo
 - **Live batch quota probe (`/agentrouter check`):** Premium models (Claude Opus, GPT-6) use periodic batch quotas on AgentRouter. Instead of guessing or getting 402 errors mid-run, run `/agentrouter check` to test live availability across all models in parallel (🟢 Ready vs ⏳ Exhausted) and inspect your total monthly spend in USD.
 - **In-flight WAF auto-recovery & false-positive bypass:** Transparently catches upstream content filter triggers (`400 content-blocked`, `500 sensitive words detected`, `405 challenge`), proactively sanitizes raw binary dumps (ELF executables, null-byte sequences), performs non-destructive tool result redaction while strictly preserving tool call arguments and assistant history, and frames prompts with language preambles without losing user instructions or breaking context.
 - **Spend tracking & pricing sync:** Queries current rates from the gateway on startup, updates settings automatically, and keeps model catalogs in sync.
-- **Subagent rate pacing:** Coordinates requests across concurrent subagents via a local lock file (`~/.pi/agent/.agentrouter-pacing`) to prevent 429 rate limit errors.
+- **Granular provider rate pacing:** Coordinates requests across concurrent subagents via local lock files (`~/.pi/agent/.agentrouter-pacing`), isolated per provider so that non-AgentRouter models (Anthropic, Gemini, Ollama) are never throttled.
 - **Isolated credentials:** Stores keys in `agentrouter-*` namespaces in `auth.json` without modifying default provider keys.
 
 ---
@@ -127,7 +127,7 @@ DeepSeek charges ~$0.014 per 1M cached input tokens versus ~$0.14 for uncached o
 AgentRouter releases daily quotas for premium models (Claude Opus 5, GPT-6 Astra) in periodic batch drops. When a batch is fully consumed, the API returns HTTP 402. Running `/agentrouter check` sends lightweight live health probes to all models in parallel, immediately displaying which models are Ready (🟢 200 OK) or Exhausted (⏳ 402), along with your current monthly spend in USD. If a premium batch is empty, switch to `deepseek-v4-flash` or `glm-5.3` which have unlimited capacity.
 
 #### Does pacing slow down other providers?
-No. Request pacing is only applied to requests routed to `agentrouter.org`. Local models and direct provider connections run without delay.
+No. Request pacing is isolated per provider via dedicated lock files and applied exclusively to requests routed to `agentrouter.org`. Direct provider connections (Google Gemini, Anthropic, local Ollama) run without pacing delays.
 
 #### Using custom subagents (`pi-subagents`)
 AgentRouter validates requests against the `pi-code` signature. If you define custom subagents in `~/.pi/agent/agents/*.md`, set `systemPromptMode: append` in their frontmatter.

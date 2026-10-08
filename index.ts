@@ -319,23 +319,29 @@ export function syncEnabledModelsInSettings(): { added: string[]; count: number 
   }
 }
 
-export function getLastRequestEndTime(): number {
+export function getLastRequestEndTime(target: string = "agentrouter"): number {
   try {
-    if (fs.existsSync(PACING_FILE)) {
-      const val = parseInt(fs.readFileSync(PACING_FILE, "utf-8").trim(), 10);
+    const file = target === "agentrouter"
+      ? PACING_FILE
+      : path.join(process.env.HOME || "", `.pi/agent/.pacing-${target.replace(/[^a-z0-9_-]/gi, "_")}`);
+    if (fs.existsSync(file)) {
+      const val = parseInt(fs.readFileSync(file, "utf-8").trim(), 10);
       if (!isNaN(val)) return val;
     }
   } catch {}
   return 0;
 }
 
-export function setLastRequestEndTime(ts: number): void {
+export function setLastRequestEndTime(ts: number, target: string = "agentrouter"): void {
   try {
-    const dir = path.dirname(PACING_FILE);
+    const file = target === "agentrouter"
+      ? PACING_FILE
+      : path.join(process.env.HOME || "", `.pi/agent/.pacing-${target.replace(/[^a-z0-9_-]/gi, "_")}`);
+    const dir = path.dirname(file);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    fs.writeFileSync(PACING_FILE, String(ts), "utf-8");
+    fs.writeFileSync(file, String(ts), "utf-8");
   } catch {}
 }
 
@@ -2216,39 +2222,48 @@ export default function (pi: ExtensionAPI) {
       ""
     ).toLowerCase();
 
-    if (isAgentRouter(provider, baseUrl) || modelId.includes("deepseek") || modelId.includes("gpt-6-astra") || modelId.includes("gpt-5.6-sol") || modelId.includes("claude-opus-5")) {
-      const lastEnd = getLastRequestEndTime();
+    const isAR = isAgentRouter(provider, baseUrl);
+
+    // Apply per-provider pacing only for AgentRouter requests
+    if (isAR) {
+      const lastEnd = getLastRequestEndTime("agentrouter");
       const now = Date.now();
       const elapsed = now - lastEnd;
       if (lastEnd > 0 && elapsed < minIntervalMs) {
         const waitMs = minIntervalMs - elapsed;
         await new Promise((resolve) => setTimeout(resolve, waitMs));
       }
+    }
 
-      if (payload) {
-        if (Array.isArray(payload.messages)) payload.messages = structuredClone(payload.messages);
-        if (Array.isArray(payload.input)) payload.input = structuredClone(payload.input);
-        if (Array.isArray(payload.system)) payload.system = structuredClone(payload.system);
-        const isDeepSeek = isDeepSeekRequest(event, ctx);
+    if (payload) {
+      if (Array.isArray(payload.messages)) payload.messages = structuredClone(payload.messages);
+      if (Array.isArray(payload.input)) payload.input = structuredClone(payload.input);
+      if (Array.isArray(payload.system)) payload.system = structuredClone(payload.system);
+      const isDeepSeek = isDeepSeekRequest(event, ctx);
 
-        if (isCompactionPayload(payload)) {
-          sanitizeCompactionPayload(payload);
-          const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
-          if (Array.isArray(messages) && messages.length > 0) {
+      if (isCompactionPayload(payload)) {
+        sanitizeCompactionPayload(payload);
+        const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+        if (Array.isArray(messages) && messages.length > 0) {
+          if (isAR) {
             normalizeMessagesForAgentRouter(messages, isDeepSeek);
             if (isDeepSeek) {
               frameUserTurnsForDeepSeek(messages);
             }
           }
-        } else {
-          if (payload.system !== undefined) {
-            payload.system = enforceCanonicalRootPrompt(payload.system);
-          }
+        }
+      } else {
+        if (isAR && payload.system !== undefined) {
+          payload.system = enforceCanonicalRootPrompt(payload.system);
+        }
 
+        if (isAR) {
           applyPoisonRedaction(payload);
+        }
 
-          const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
-          if (Array.isArray(messages) && messages.length > 0) {
+        const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+        if (Array.isArray(messages) && messages.length > 0) {
+          if (isAR) {
             normalizeMessagesForAgentRouter(messages, isDeepSeek);
 
             if (isDeepSeek) {
@@ -2266,9 +2281,9 @@ export default function (pi: ExtensionAPI) {
             }
           }
         }
-        if (Array.isArray(payload.tools) && payload.tools.length > 0) {
-          sanitizeOpenAiTools(payload.tools);
-        }
+      }
+      if (isAR && Array.isArray(payload.tools) && payload.tools.length > 0) {
+        sanitizeOpenAiTools(payload.tools);
       }
     }
     return payload;
@@ -2672,7 +2687,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.3.1]\n` +
+        `[AgentRouter Plugin v2.3.2]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
