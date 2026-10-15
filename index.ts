@@ -20,9 +20,11 @@ export interface ModelSpec {
   providerType: "openai" | "anthropic";
   api?: string;
   headers?: Record<string, string>;
+  input?: ("text" | "image")[];
   contextWindow: number;
   maxTokens: number;
   reasoning: boolean;
+  thinkingLevelMap?: Record<string, string | null>;
   compat?: Record<string, any>;
   cost?: {
     input: number;
@@ -49,11 +51,24 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     name: "gpt-6-astra",
     providerType: "openai",
     api: "openai-responses",
+    input: ["text", "image"],
     contextWindow: 1048576,
     maxTokens: 131072,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: false },
-    cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 8.0 / 1_000_000, output: 40.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+  },
+  "gpt-6.1-sol": {
+    id: "gpt-6.1-sol",
+    name: "gpt-6.1-sol",
+    providerType: "openai",
+    api: "openai-responses",
+    input: ["text", "image"],
+    contextWindow: 1050000,
+    maxTokens: 128000,
+    reasoning: true,
+    compat: { sendSessionAffinityHeaders: false },
+    cost: { input: 4.0 / 1_000_000, output: 20.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "deepseek-v4-flash": {
     id: "deepseek-v4-flash",
@@ -99,16 +114,6 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     compat: { sendSessionAffinityHeaders: false },
     cost: { input: 3.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
-  "gpt-5.6-sol": {
-    id: "gpt-5.6-sol",
-    name: "gpt-5.6-sol",
-    providerType: "openai",
-    contextWindow: 1048576,
-    maxTokens: 131072,
-    reasoning: true,
-    compat: { sendSessionAffinityHeaders: false },
-    cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
-  },
   "gpt-5.5": {
     id: "gpt-5.5",
     name: "gpt-5.5",
@@ -123,6 +128,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     id: "claude-opus-4-8",
     name: "claude-opus-4-8",
     providerType: "anthropic",
+    input: ["text", "image"],
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
@@ -134,10 +140,27 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     },
     cost: { input: 8.0 / 1_000_000, output: 40.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
+  "claude-opus-5-5": {
+    id: "claude-opus-5-5",
+    name: "claude-opus-5-5",
+    providerType: "anthropic",
+    input: ["text", "image"],
+    contextWindow: 1000000,
+    maxTokens: 128000,
+    reasoning: true,
+    compat: {
+      forceAdaptiveThinking: true,
+      allowEmptySignature: true,
+      sendSessionAffinityHeaders: true,
+      supportsEagerToolInputStreaming: false,
+    },
+    cost: { input: 12.0 / 1_000_000, output: 12.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+  },
   "claude-opus-5": {
     id: "claude-opus-5",
     name: "claude-opus-5",
     providerType: "anthropic",
+    input: ["text", "image"],
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
@@ -153,6 +176,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     id: "claude-opus-4-7",
     name: "claude-opus-4-7",
     providerType: "anthropic",
+    input: ["text", "image"],
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
@@ -168,6 +192,7 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     id: "claude-opus-4-6",
     name: "claude-opus-4-6",
     providerType: "anthropic",
+    input: ["text", "image"],
     contextWindow: 1048576,
     maxTokens: 65536,
     reasoning: true,
@@ -292,16 +317,33 @@ export function fixPackagePriorityInSettings(): boolean {
 export const FLAGSHIP_MODELS: string[] = [
   "agentrouter-openai/deepseek-v4-flash",
   "agentrouter-openai/gpt-6-astra",
+  "agentrouter-openai/gpt-6.1-sol",
+  "agentrouter-clode/claude-opus-5-5",
+];
+
+export const DECOMMISSIONED_MODELS: string[] = [
   "agentrouter-openai/gpt-5.6-sol",
   "agentrouter-clode/claude-opus-5",
   "agentrouter-clode/claude-opus-4-8",
+  "agentrouter-openai/glm-5.3",
+  "agentrouter-openai/glm-5.2",
+  "agentrouter-openai/gpt-5.5",
 ];
 
-export function syncEnabledModelsInSettings(): { added: string[]; count: number } {
+export const DECOMMISSIONED_MODEL_IDS = new Set<string>([
+  "gpt-5.6-sol",
+  "claude-opus-5",
+  "claude-opus-4-8",
+  "glm-5.3",
+  "glm-5.2",
+  "gpt-5.5",
+]);
+
+export function syncEnabledModelsInSettings(): { added: string[]; removed: string[]; count: number } {
   try {
-    if (!fs.existsSync(SETTINGS_FILE)) return { added: [], count: 0 };
+    if (!fs.existsSync(SETTINGS_FILE)) return { added: [], removed: [], count: 0 };
     const settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf-8"));
-    if (!Array.isArray(settings.enabledModels)) return { added: [], count: 0 };
+    if (!Array.isArray(settings.enabledModels)) return { added: [], removed: [], count: 0 };
 
     const added: string[] = [];
     for (const m of FLAGSHIP_MODELS) {
@@ -310,12 +352,22 @@ export function syncEnabledModelsInSettings(): { added: string[]; count: number 
         added.push(m);
       }
     }
-    if (added.length > 0) {
+
+    const removed: string[] = [];
+    for (const decomm of DECOMMISSIONED_MODELS) {
+      const decommIndex = settings.enabledModels.indexOf(decomm);
+      if (decommIndex !== -1) {
+        settings.enabledModels.splice(decommIndex, 1);
+        removed.push(decomm);
+      }
+    }
+
+    if (added.length > 0 || removed.length > 0) {
       fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), "utf-8");
     }
-    return { added, count: settings.enabledModels.length };
+    return { added, removed, count: settings.enabledModels.length };
   } catch {
-    return { added: [], count: 0 };
+    return { added: [], removed: [], count: 0 };
   }
 }
 
@@ -2081,12 +2133,15 @@ export default function (pi: ExtensionAPI) {
             id: spec.id,
             name: spec.name,
             reasoning: spec.reasoning,
-            input: ["text"],
+            input: spec.input || ["text"],
             contextWindow: spec.contextWindow,
             maxTokens: spec.maxTokens,
             cost: { input: inCost, output: outCost, cacheRead: 0, cacheWrite: 0 },
             compat: spec.compat || { sendSessionAffinityHeaders: true },
           };
+          if (spec.thinkingLevelMap) {
+            modelObj.thinkingLevelMap = { ...spec.thinkingLevelMap };
+          }
           if (spec.api) {
             modelObj.api = spec.api;
           }
@@ -2101,12 +2156,17 @@ export default function (pi: ExtensionAPI) {
         } else {
           newModels.push(id);
           const isAnthropic =
-            item.supported_endpoint_types.includes("anthropic") && !item.supported_endpoint_types.includes("openai");
+            id.toLowerCase().startsWith("claude") ||
+            (item.supported_endpoint_types.includes("anthropic") && !item.supported_endpoint_types.includes("openai"));
+          const isVision =
+            id.toLowerCase().includes("vision") ||
+            id.toLowerCase().startsWith("claude") ||
+            id.toLowerCase().startsWith("gpt-6");
           const modelObj = {
             id,
             name: id,
             reasoning: true,
-            input: ["text"],
+            input: isVision ? ["text", "image"] : ["text"],
             contextWindow: 131072,
             maxTokens: 16384,
             cost: { input: inCost, output: outCost, cacheRead: 0, cacheWrite: 0 },
@@ -2129,28 +2189,34 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    for (const [id, spec] of Object.entries(KNOWN_MODEL_SPECS)) {
-      if (!processed.has(id)) {
-        const modelObj: any = {
-          id: spec.id,
-          name: spec.name,
-          reasoning: spec.reasoning,
-          input: ["text"],
-          contextWindow: spec.contextWindow,
-          maxTokens: spec.maxTokens,
-          cost: spec.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          compat: spec.compat || { sendSessionAffinityHeaders: true },
-        };
-        if (spec.api) {
-          modelObj.api = spec.api;
-        }
-        if (spec.headers) {
-          modelObj.headers = { ...spec.headers };
-        }
-        if (spec.providerType === "anthropic") {
-          claudeModels.push(modelObj);
-        } else {
-          openaiModels.push(modelObj);
+    if (!apiPricing || apiPricing.length === 0) {
+      for (const [id, spec] of Object.entries(KNOWN_MODEL_SPECS)) {
+        if (DECOMMISSIONED_MODEL_IDS.has(id)) continue;
+        if (!processed.has(id)) {
+          const modelObj: any = {
+            id: spec.id,
+            name: spec.name,
+            reasoning: spec.reasoning,
+            input: spec.input || ["text"],
+            contextWindow: spec.contextWindow,
+            maxTokens: spec.maxTokens,
+            cost: spec.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            compat: spec.compat || { sendSessionAffinityHeaders: true },
+          };
+          if (spec.thinkingLevelMap) {
+            modelObj.thinkingLevelMap = { ...spec.thinkingLevelMap };
+          }
+          if (spec.api) {
+            modelObj.api = spec.api;
+          }
+          if (spec.headers) {
+            modelObj.headers = { ...spec.headers };
+          }
+          if (spec.providerType === "anthropic") {
+            claudeModels.push(modelObj);
+          } else {
+            openaiModels.push(modelObj);
+          }
         }
       }
     }
@@ -2628,14 +2694,16 @@ export default function (pi: ExtensionAPI) {
         const modelsToProbe = pricingList
           ? pricingList.map((p) => ({
               id: p.model_name,
-              isAnthropic: p.supported_endpoint_types.includes("anthropic") && !p.supported_endpoint_types.includes("openai"),
+              isAnthropic:
+                KNOWN_MODEL_SPECS[p.model_name]?.providerType === "anthropic" ||
+                p.model_name.toLowerCase().startsWith("claude") ||
+                (p.supported_endpoint_types.includes("anthropic") && !p.supported_endpoint_types.includes("openai")),
             }))
           : [
               { id: "deepseek-v4-flash", isAnthropic: false },
               { id: "gpt-6-astra", isAnthropic: false },
-              { id: "gpt-5.6-sol", isAnthropic: false },
-              { id: "claude-opus-5", isAnthropic: true },
-              { id: "claude-opus-4-8", isAnthropic: true },
+              { id: "gpt-6.1-sol", isAnthropic: false },
+              { id: "claude-opus-5-5", isAnthropic: true },
             ];
 
         const probeResults = await Promise.all(
@@ -2687,7 +2755,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.3.2]\n` +
+        `[AgentRouter Plugin v2.3.3]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +

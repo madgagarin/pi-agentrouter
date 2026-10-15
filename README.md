@@ -4,31 +4,40 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Pi Plugin](https://img.shields.io/badge/Pi-Extension-purple.svg)](https://pi.dev)
 
-Pi Coding Agent extension for [AgentRouter](https://agentrouter.org). Adds support for DeepSeek V4 Flash, Claude Opus 5, GPT-6 Astra, and GLM 5.3 with in-flight WAF auto-recovery, automatic retry orchestration, prompt caching optimization, and live pricing.
-
-> AgentRouter provides free trial credits on registration at [agentrouter.org](https://agentrouter.org/register?aff=34dc).
+Pi Coding Agent extension for [AgentRouter](https://agentrouter.org). Adds support for Claude Opus 5.5, GPT-6.1 Sol, GPT-6 Astra, and DeepSeek V4 Flash with in-flight WAF recovery, prompt caching optimization, and live quota monitoring.
 
 ---
 
-## Features
+## Why this extension exists
 
-- **Multi-model access with one key:** Use DeepSeek V4 Flash, Claude Opus 5/4.8, GPT-6 Astra, and GPT-5.6 Sol through a single endpoint. No need to manage separate billing accounts across OpenAI, Anthropic, and DeepSeek. Switch models in Pi with `Ctrl+P`.
-- **Automatic error recovery (no crashed runs):** Intercepts transient gateway errors (rate limits, 500/503, thinking-mode 400/422 validation issues) and retries up to 10 times with exponential backoff and unpinned session headers. Long autonomous tasks continue running instead of aborting midway.
-- **Prompt caching optimization (~90% cost reduction):** Enforces strict prefix stability across requests so DeepSeek and Claude prompt caches hit ~95% in multi-turn sessions, significantly reducing input token costs.
-- **Context compaction cleanup:** Automatically strips raw tool output dumps and internal thinking traces when running `/compact`, shrinking the payload by 80–90% without losing instructions.
-- **Live batch quota probe (`/agentrouter check`):** Premium models (Claude Opus, GPT-6) use periodic batch quotas on AgentRouter. Instead of guessing or getting 402 errors mid-run, run `/agentrouter check` to test live availability across all models in parallel (🟢 Ready vs ⏳ Exhausted) and inspect your total monthly spend in USD.
-- **In-flight WAF auto-recovery & false-positive bypass:** Transparently catches upstream content filter triggers (`400 content-blocked`, `500 sensitive words detected`, `405 challenge`), proactively sanitizes raw binary dumps (ELF executables, null-byte sequences), performs non-destructive tool result redaction while strictly preserving tool call arguments and assistant history, and frames prompts with language preambles without losing user instructions or breaking context.
-- **Spend tracking & pricing sync:** Queries current rates from the gateway on startup, updates settings automatically, and keeps model catalogs in sync.
-- **Granular provider rate pacing:** Coordinates requests across concurrent subagents via local lock files (`~/.pi/agent/.agentrouter-pacing`), isolated per provider so that non-AgentRouter models (Anthropic, Gemini, Ollama) are never throttled.
-- **Isolated credentials:** Stores keys in `agentrouter-*` namespaces in `auth.json` without modifying default provider keys.
+If you configure AgentRouter as a generic OpenAI or Anthropic endpoint in Pi, you will run into several recurring issues:
+
+1. **Gateway content filters lock up sessions:** AgentRouter's upstream gateway blocks requests containing binary output (such as reading a `.so` or compiled file) or certain keywords with `400 content-blocked` or `500 sensitive words detected`. Because Pi sends previous conversation turns with each request, that error stays in context and every subsequent retry fails. **This extension catches the error, redacts the problematic output from in-memory history, and retries cleanly.**
+2. **Prompt caching errors & extra costs:** Standard Anthropic caching headers (`cache_control`) trigger `400 Bad Request` on non-Anthropic endpoints, and changing prompt prefixes invalidates DeepSeek caches. **This extension enforces prefix stability so DeepSeek and Claude hit ~95% cache rates, cutting token costs by ~90% without throwing 400s.**
+3. **Reasoning mode mismatches:** DeepSeek and Claude Opus use different schemas for thinking traces. Sending raw thinking payloads through the proxy causes `400` or `422` validation errors. **This extension normalizes thinking parameters per-model automatically.**
+4. **Sudden 402 quota errors:** Claude Opus 5.5 and GPT-6 quotas are released in daily batches (10:00 & 19:00 Beijing time). When a batch runs out, the API returns `402`. **Run `/agentrouter check` to see which models are ready before starting a long task, or switch to unlimited DeepSeek V4 Flash.**
+5. **Subagent rate limits (429):** Running concurrent subagents easily trips AgentRouter's per-minute limits. **This extension includes file-based request pacing that only throttles AgentRouter calls, leaving direct providers (Gemini, local Ollama) unaffected.**
+
+---
+
+## Free credits & referral bonus
+
+AgentRouter is completely free to use and does not accept paid top-ups. Compute is distributed via signup bonuses and daily logins:
+
+- **$50 signup credit:** If you register through [this referral link](https://agentrouter.org/register?aff=34dc), you get $50 in free credit instead of starting at $0. (It also gives me test credits to maintain this plugin).
+- **$25 daily login bonus:** You get an extra $25 credit automatically every day upon logging in. If you stay logged in from yesterday, just log out and back in once to collect it.
+- **Quota refresh times:** Batch quotas for Claude Opus 5.5 and GPT-6.1 Sol refill daily at 10:00 and 19:00 Beijing time (05:00 and 14:00 MSK / 02:00 and 11:00 UTC). DeepSeek V4 Flash has unlimited availability.
+
+👉 **[Register on AgentRouter (with $50 bonus)](https://agentrouter.org/register?aff=34dc)**  
+*(Referral code `34dc` is attached automatically, whether registering directly or via GitHub OAuth).*
 
 ---
 
 ## Quick Start
 
-### 1. Get an API key
+### 1. Get an API key (Free $50 on Registration)
 
-Create an account at [agentrouter.org](https://agentrouter.org/register?aff=34dc) and copy your `sk-...` key from the dashboard.
+Create an account at [agentrouter.org/register?aff=34dc](https://agentrouter.org/register?aff=34dc) to claim your instant $50 welcome credits, and copy your `sk-...` key from the dashboard.
 
 ### 2. Install the extension
 
@@ -57,13 +66,11 @@ Rates are pulled dynamically from the gateway API ($2.00 / 1M tokens base unit):
 | Model | Provider | Context | Output | Reasoning | Input / 1M | Output / 1M | Cache Read / 1M | Quota Policy |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | `deepseek-v4-flash` | `agentrouter-openai` | 1M | 64K | Yes | $4.00 | $12.00 | $2.00 | Unlimited |
-| `glm-5.3` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $12.00 | - | Unlimited |
-| `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | - | Daily batch drops |
-| `gpt-5.6-sol` | `agentrouter-openai` | 1M | 128K | Yes | $3.00 | $15.00 | - | Daily batch drops |
-| `claude-opus-5` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $6.00 | $30.00 | - | Daily batch drops |
-| `claude-opus-4-8` | `agentrouter-clode` | 1M | 64K | Yes (Adaptive) | $8.00 | $40.00 | - | Daily batch drops |
+| `gpt-6.1-sol` | `agentrouter-openai` | 1.05M | 128K | Yes | $4.00 | $20.00 | - | Daily batch drops |
+| `gpt-6-astra` | `agentrouter-openai` | 1M | 128K | Yes | $8.00 | $40.00 | - | Daily batch drops |
+| `claude-opus-5-5` | `agentrouter-clode` | 1M | 128K | Yes (Adaptive) | $12.00 | $12.00 | - | Daily batch drops |
 
-Claude and GPT quotas are released in batches throughout the day. When a batch is consumed (HTTP 402), check availability with `/agentrouter check` or switch to unlimited models (`deepseek-v4-flash` / `glm-5.3`).
+Claude and GPT quotas are released in batches throughout the day. When a batch is consumed (HTTP 402), check availability with `/agentrouter check` or switch to unlimited `deepseek-v4-flash`.
 
 ---
 
@@ -86,7 +93,7 @@ Claude and GPT quotas are released in batches throughout the day. When a batch i
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Ctrl + P` | Cycle to next model (`deepseek-v4-flash` ➔ `gpt-6-astra` ➔ `gpt-5.6-sol` ➔ `claude-opus-5` ➔ `claude-opus-4-8`) |
+| `Ctrl + P` | Cycle to next model (`deepseek-v4-flash` ➔ `gpt-6-astra` ➔ `gpt-6.1-sol` ➔ `claude-opus-5-5`) |
 | `Shift + Ctrl + P` | Cycle to previous model |
 | `Shift + Tab` | Change reasoning depth (`off` ➔ `minimal` ➔ `low` ➔ `medium` ➔ `high`) |
 | `Ctrl + T` | Toggle reasoning visibility |
@@ -106,9 +113,8 @@ Add this to `~/.pi/agent/settings.json` for quick model switching:
   "enabledModels": [
     "agentrouter-openai/deepseek-v4-flash",
     "agentrouter-openai/gpt-6-astra",
-    "agentrouter-openai/gpt-5.6-sol",
-    "agentrouter-clode/claude-opus-5",
-    "agentrouter-clode/claude-opus-4-8"
+    "agentrouter-openai/gpt-6.1-sol",
+    "agentrouter-clode/claude-opus-5-5"
   ]
 }
 ```
@@ -124,7 +130,13 @@ The extension intercepts requests at the transport level. If the gateway returns
 DeepSeek charges ~$0.014 per 1M cached input tokens versus ~$0.14 for uncached ones. Because this extension prevents dynamic prompt rewrites and ensures prefix determinism, multi-turn coding sessions routinely achieve 95%+ cache hit rates, saving substantial costs over long runs.
 
 #### How do batch quotas and `/agentrouter check` work?
-AgentRouter releases daily quotas for premium models (Claude Opus 5, GPT-6 Astra) in periodic batch drops. When a batch is fully consumed, the API returns HTTP 402. Running `/agentrouter check` sends lightweight live health probes to all models in parallel, immediately displaying which models are Ready (🟢 200 OK) or Exhausted (⏳ 402), along with your current monthly spend in USD. If a premium batch is empty, switch to `deepseek-v4-flash` or `glm-5.3` which have unlimited capacity.
+AgentRouter releases daily quotas for premium models (Claude Opus 5.5, GPT-6.1 Sol, GPT-6 Astra) in periodic batch drops. When a batch is fully consumed, the API returns HTTP 402. Running `/agentrouter check` sends lightweight live health probes to all models in parallel, immediately displaying which models are Ready (🟢 200 OK) or Exhausted (⏳ 402), along with your current monthly spend in USD. If a premium batch is empty, switch to `deepseek-v4-flash` which has unlimited capacity.
+
+#### How do free credits and daily check-ins work?
+AgentRouter is completely free and does not accept paid top-ups. Compute is distributed via welcome bonuses and daily rewards:
+- **Registration Bonus:** You receive **$50.00** in free balance upon registration when using the [community referral link](https://agentrouter.org/register?aff=34dc) (versus $0 on plain direct signup).
+- **Daily Login Check-In:** The platform uses automatic login check-in (`登录签到`). You receive **$25.00** every day upon logging in (no manual button required). If you remain logged in from the previous day, simply log out and back in to trigger the daily check-in (*"签到成功，新增额度已到账"*).
+- **Quota Drops:** Quotas for flagship models (Claude Opus 5.5, GPT-6.1 Sol) refresh daily in batches at **10:00** and **19:00 Beijing time** (05:00 and 14:00 MSK / 02:00 and 11:00 UTC). Between batch drops, `deepseek-v4-flash` remains available around the clock.
 
 #### Does pacing slow down other providers?
 No. Request pacing is isolated per provider via dedicated lock files and applied exclusively to requests routed to `agentrouter.org`. Direct provider connections (Google Gemini, Anthropic, local Ollama) run without pacing delays.
