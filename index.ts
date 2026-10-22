@@ -68,7 +68,19 @@ export const KNOWN_MODEL_SPECS: Record<string, ModelSpec> = {
     maxTokens: 128000,
     reasoning: true,
     compat: { sendSessionAffinityHeaders: false },
-    cost: { input: 4.0 / 1_000_000, output: 20.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+    cost: { input: 3.0 / 1_000_000, output: 15.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
+  },
+  "gpt-5.6-sol": {
+    id: "gpt-5.6-sol",
+    name: "gpt-5.6-sol",
+    providerType: "openai",
+    api: "openai-responses",
+    input: ["text", "image"],
+    contextWindow: 1048576,
+    maxTokens: 131072,
+    reasoning: true,
+    compat: { sendSessionAffinityHeaders: false },
+    cost: { input: 8.0 / 1_000_000, output: 40.0 / 1_000_000, cacheRead: 0, cacheWrite: 0 },
   },
   "deepseek-v4-flash": {
     id: "deepseek-v4-flash",
@@ -318,22 +330,25 @@ export const FLAGSHIP_MODELS: string[] = [
   "agentrouter-openai/deepseek-v4-flash",
   "agentrouter-openai/gpt-6-astra",
   "agentrouter-openai/gpt-6.1-sol",
+  "agentrouter-openai/gpt-5.6-sol",
   "agentrouter-clode/claude-opus-5-5",
 ];
 
 export const DECOMMISSIONED_MODELS: string[] = [
-  "agentrouter-openai/gpt-5.6-sol",
   "agentrouter-clode/claude-opus-5",
   "agentrouter-clode/claude-opus-4-8",
+  "agentrouter-clode/claude-opus-4-7",
+  "agentrouter-clode/claude-opus-4-6",
   "agentrouter-openai/glm-5.3",
   "agentrouter-openai/glm-5.2",
   "agentrouter-openai/gpt-5.5",
 ];
 
 export const DECOMMISSIONED_MODEL_IDS = new Set<string>([
-  "gpt-5.6-sol",
   "claude-opus-5",
   "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
   "glm-5.3",
   "glm-5.2",
   "gpt-5.5",
@@ -397,9 +412,15 @@ export function setLastRequestEndTime(ts: number, target: string = "agentrouter"
   } catch {}
 }
 
+export function isAgentRouterUrl(urlStr?: string): boolean {
+  if (!urlStr || typeof urlStr !== "string") return false;
+  const lower = urlStr.toLowerCase();
+  return lower.includes("agentrouter.org") || lower.includes("air-outer.com");
+}
+
 export function isAgentRouter(providerName?: string, baseUrl?: string): boolean {
   if (providerName && providerName.toLowerCase().includes("agentrouter")) return true;
-  if (baseUrl && baseUrl.toLowerCase().includes("agentrouter.org")) return true;
+  if (baseUrl && isAgentRouterUrl(baseUrl)) return true;
   return false;
 }
 
@@ -503,7 +524,16 @@ export function enforceToolCallPairing(messages: any[]): void {
         const hasMatchingToolCall = prevAssistant.tool_calls.some(
           (tc: any) => tc && (tc.id === toolCallId || (!toolCallId && tc.id))
         );
-        if (!hasMatchingToolCall && toolCallId) {
+        const hasContentToolCalls =
+          Array.isArray(prevAssistant.content) &&
+          prevAssistant.content.some(
+            (b: any) =>
+              b &&
+              typeof b === "object" &&
+              (b.type === "toolCall" || b.type === "tool_use" || b.type === "function_call") &&
+              (b.id === toolCallId || b.tool_call_id === toolCallId || (!toolCallId && (b.id || b.tool_call_id)))
+          );
+        if (!hasMatchingToolCall && !hasContentToolCalls && toolCallId) {
           prevAssistant.tool_calls.push({
             id: toolCallId,
             type: "function",
@@ -749,6 +779,56 @@ export function sanitizeOpenAiTools(tools: any[]): void {
     const fn = tool.function || tool;
     if (fn.parameters && typeof fn.parameters === "object") {
       cleanJsonSchemaObject(fn.parameters);
+    }
+  }
+}
+
+export function sanitizeResponsesInput(input: any[]): void {
+  if (!Array.isArray(input)) return;
+  for (let i = input.length - 1; i >= 0; i--) {
+    const item = input[i];
+    if (!item || typeof item !== "object") continue;
+
+    // 1. Strip reasoning items (which contain encrypted_content and rs_ IDs tied to a specific Azure OpenAI backend node)
+    if (
+      item.type === "reasoning" ||
+      "encrypted_content" in item ||
+      (typeof item.id === "string" && item.id.startsWith("rs_"))
+    ) {
+      input.splice(i, 1);
+      continue;
+    }
+
+    // 2. Strip failed assistant messages with errors
+    if (item.type === "message" && item.role === "assistant" && item.status === "error") {
+      input.splice(i, 1);
+      continue;
+    }
+
+    // 3. Strip Azure OpenAI node-specific item IDs (fc_, ctc_, msg_, etc.) to prevent
+    // 400 "The requested item was created under a different Azure OpenAI resource"
+    // when load-balanced across multiple Azure OpenAI backend instances.
+    // In Responses API, function calls correlate with outputs strictly via call_id, not item id.
+    if ("id" in item) {
+      delete item.id;
+    }
+
+    // 4. Strip nested reasoning blocks and nested IDs from message content
+    if (Array.isArray(item.content)) {
+      for (let c = item.content.length - 1; c >= 0; c--) {
+        const block = item.content[c];
+        if (block && typeof block === "object") {
+          if (
+            block.type === "reasoning" ||
+            "encrypted_content" in block ||
+            (typeof block.id === "string" && block.id.startsWith("rs_"))
+          ) {
+            item.content.splice(c, 1);
+          } else if ("id" in block) {
+            delete block.id;
+          }
+        }
+      }
     }
   }
 }
@@ -1608,13 +1688,30 @@ export async function fetchTokenUsage(apiKey: string): Promise<number | null> {
 
 export interface ModelProbeResult {
   model: string;
-  status: "READY" | "QUOTA_EXHAUSTED" | "FORBIDDEN" | "ERROR";
+  status: "READY" | "QUOTA_EXHAUSTED" | "NOT_IN_TOKEN" | "FORBIDDEN" | "ERROR";
   code: number;
   message?: string;
 }
 
-export async function probeModelQuota(modelId: string, apiKey: string, isAnthropic: boolean): Promise<ModelProbeResult> {
-  const url = isAnthropic ? "https://agentrouter.org/v1/messages" : "https://agentrouter.org/v1/chat/completions";
+export async function probeModelQuota(
+  modelId: string,
+  apiKey: string,
+  isAnthropic: boolean,
+  isResponsesApi?: boolean
+): Promise<ModelProbeResult> {
+  const isResponses =
+    isResponsesApi ??
+    (KNOWN_MODEL_SPECS[modelId]?.api === "openai-responses" ||
+      modelId.startsWith("gpt-6") ||
+      modelId.includes("-sol"));
+
+  let url = "https://agentrouter.org/v1/chat/completions";
+  if (isAnthropic) {
+    url = "https://agentrouter.org/v1/messages";
+  } else if (isResponses) {
+    url = "https://agentrouter.org/v1/responses";
+  }
+
   const headers = isAnthropic
     ? {
         "Content-Type": "application/json",
@@ -1628,21 +1725,30 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
         "User-Agent": getPiUserAgent(),
       };
 
-  const body = isAnthropic
-    ? {
-        model: modelId,
-        system: CANONICAL_PI_HEADER,
-        messages: [{ role: "user", content: "ping" }],
-        max_tokens: 1,
-      }
-    : {
-        model: modelId,
-        messages: [
-          { role: "system", content: CANONICAL_PI_HEADER },
-          { role: "user", content: "ping" },
-        ],
-        max_tokens: 1,
-      };
+  let body: any;
+  if (isAnthropic) {
+    body = {
+      model: modelId,
+      system: CANONICAL_PI_HEADER,
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 16,
+    };
+  } else if (isResponses) {
+    body = {
+      model: modelId,
+      input: [{ role: "user", content: "ping" }],
+      max_output_tokens: 16,
+    };
+  } else {
+    body = {
+      model: modelId,
+      messages: [
+        { role: "system", content: CANONICAL_PI_HEADER },
+        { role: "user", content: "ping" },
+      ],
+      max_tokens: 16,
+    };
+  }
 
   try {
     const res = await fetch(url, {
@@ -1664,8 +1770,24 @@ export async function probeModelQuota(modelId: string, apiKey: string, isAnthrop
     ) {
       return { model: modelId, status: "QUOTA_EXHAUSTED", code: 402, message: msg };
     }
+    if (
+      res.status === 403 ||
+      msg.includes("无权访问模型") ||
+      msg.toLowerCase().includes("no permission") ||
+      msg.toLowerCase().includes("not allowed to access")
+    ) {
+      return {
+        model: modelId,
+        status: "NOT_IN_TOKEN",
+        code: 403,
+        message: "Model not enabled for this token in AgentRouter dashboard",
+      };
+    }
     if (res.status === 403) {
       return { model: modelId, status: "FORBIDDEN", code: 403, message: msg };
+    }
+    if (res.status === 503 || msg.includes("无可用渠道") || msg.includes("no available channel")) {
+      return { model: modelId, status: "ERROR", code: 503, message: "Channel temporarily paused on gateway (503)" };
     }
     return { model: modelId, status: "ERROR", code: res.status, message: msg };
   } catch (err: any) {
@@ -1832,7 +1954,132 @@ export function removeHeader(headers: unknown, name: string): void {
   }
 }
 
+export function wrapStreamWithBuffer(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  buffered: Uint8Array[]
+): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (buffered.length > 0) {
+        controller.enqueue(buffered.shift()!);
+        return;
+      }
+      const { value, done } = await reader.read();
+      if (done) {
+        controller.close();
+      } else {
+        controller.enqueue(value);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+export async function inspectStreamInitialChunks(
+  response: Response
+): Promise<{ response: Response; isError: boolean; errorText: string }> {
+  if (!response.body) return { response, isError: false, errorText: "" };
+  const reader = response.body.getReader();
+  const buffered: Uint8Array[] = [];
+  const decoder = new TextDecoder();
+  let accumulated = "";
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffered.push(value);
+      accumulated += decoder.decode(value, { stream: true });
+      const lower = accumulated.toLowerCase();
+
+      // Check if normal model generation has begun (Responses API, Chat Completions, Anthropic)
+      const isProgress =
+        lower.includes("output_item.") ||
+        lower.includes("content_part.") ||
+        lower.includes("output_text.") ||
+        lower.includes("reasoning_summary") ||
+        lower.includes("function_call_arguments") ||
+        lower.includes("custom_tool_call") ||
+        lower.includes("response.completed") ||
+        lower.includes("response.incomplete") ||
+        lower.includes("choices") ||
+        lower.includes("content_block") ||
+        lower.includes("message_start") ||
+        lower.includes("message_delta") ||
+        lower.includes("[done]");
+
+      if (isProgress) {
+        const wrapped = wrapStreamWithBuffer(reader, buffered);
+        return {
+          response: new Response(wrapped, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          }),
+          isError: false,
+          errorText: "",
+        };
+      }
+
+      // Check for upstream stream-level error signatures
+      const hasFailedStatus = /"status"\s*:\s*"failed"/i.test(accumulated);
+      const hasRateLimitSignature =
+        lower.includes("token rate limit") ||
+        lower.includes("exceeded token rate limit") ||
+        lower.includes("rate_limit_exceeded") ||
+        lower.includes("rate limit exceeded");
+      const hasAzureCrossResourceSignature =
+        lower.includes("different azure openai resource") ||
+        lower.includes("different azure resource") ||
+        lower.includes("use the same resource") ||
+        lower.includes("could not be decrypted") ||
+        lower.includes("decryption failure") ||
+        lower.includes("decryption_failure");
+
+      const isStreamError =
+        lower.includes("response.failed") ||
+        lower.includes("event: error") ||
+        hasFailedStatus ||
+        hasRateLimitSignature ||
+        hasAzureCrossResourceSignature ||
+        (lower.startsWith("data:") && /data:\s*\{\s*"error"\s*:\s*\{/i.test(accumulated)) ||
+        (!lower.includes("event: response.created") &&
+          (lower.includes("the operation was aborted") ||
+            lower.includes("temporarily unavailable") ||
+            (/"error"\s*:\s*\{[^}]+\}/i.test(accumulated))));
+
+      if (isStreamError) {
+        try {
+          await reader.cancel("Upstream error detected in stream");
+        } catch {}
+        return { response, isError: true, errorText: accumulated };
+      }
+    }
+  } catch (readErr: any) {
+    try {
+      await reader.cancel(readErr);
+    } catch {}
+    return { response, isError: true, errorText: readErr?.message || "Stream read failed" };
+  }
+
+  // End of stream reached without explicit error or generation
+  const wrapped = wrapStreamWithBuffer(reader, buffered);
+  return {
+    response: new Response(wrapped, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    }),
+    isError: false,
+    errorText: "",
+  };
+}
+
 let fetchHookInstalled = false;
+let lastRateLimitTime = 0;
+let rateLimitSalt = 0;
 
 export function installAgentRouterFetchHook(): void {
   if (fetchHookInstalled) return;
@@ -1843,7 +2090,7 @@ export function installAgentRouterFetchHook(): void {
   globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request)?.url || "";
 
-    if (urlStr.includes("agentrouter.org")) {
+    if (isAgentRouterUrl(urlStr)) {
       const piUa = getPiUserAgent();
       if (!init) {
         init = { headers: { "User-Agent": piUa } };
@@ -1882,6 +2129,21 @@ export function installAgentRouterFetchHook(): void {
         }
       }
 
+      if (Date.now() - lastRateLimitTime < 120000 && rateLimitSalt > 0) {
+        lastAgentRouterCookie = "";
+        if (init?.headers) {
+          removeHeader(init.headers, "cookie");
+          removeHeader(init.headers, "x-session-affinity");
+          removeHeader(init.headers, "affinity");
+          const origSessionId = getHeader(init.headers, "session_id");
+          if (origSessionId) {
+            const baseSessionId = origSessionId.replace(/-rl\d+$/, "").replace(/-r\d+$/, "");
+            setHeader(init.headers, "session_id", `${baseSessionId}-rl${rateLimitSalt}`);
+          }
+          setHeader(init.headers, "x-client-request-id", crypto.randomUUID());
+        }
+      }
+
       if (init && typeof init.body === "string") {
         try {
           const body = JSON.parse(init.body);
@@ -1891,6 +2153,11 @@ export function installAgentRouterFetchHook(): void {
             const isResponsesEndpoint = urlStr.includes("/responses");
             const isCompaction = isCompactionPayload(body);
             const origLen = init.body.length;
+
+            if (Date.now() - lastRateLimitTime < 120000 && rateLimitSalt > 0 && typeof body.prompt_cache_key === "string") {
+              const baseKey = body.prompt_cache_key.replace(/-v\d+$/, "");
+              body.prompt_cache_key = `${baseKey}-v${rateLimitSalt}`;
+            }
 
             if (isDeepSeek && "thinking" in body) {
               delete body.thinking;
@@ -1925,6 +2192,12 @@ export function installAgentRouterFetchHook(): void {
               if (Array.isArray(body.tools) && body.tools.length > 0) {
                 sanitizeOpenAiTools(body.tools);
               }
+              if (Array.isArray(body.input)) {
+                sanitizeResponsesInput(body.input);
+              }
+              if ("previous_response_id" in body) {
+                delete body.previous_response_id;
+              }
               init.body = JSON.stringify(body);
               arDebugLog(`[FetchHook] Responses turn intercepted: model=${modelId} origLen=${origLen} newLen=${init.body.length}`);
             }
@@ -1935,25 +2208,60 @@ export function installAgentRouterFetchHook(): void {
       }
     }
 
-    let response = await originalFetch.call(this, input, init);
-
-    if (urlStr.includes("agentrouter.org")) {
-      const respCookie = extractCookieFromResponse(response);
-      if (respCookie) {
-        lastAgentRouterCookie = respCookie;
+    let response: Response;
+    try {
+      response = await originalFetch.call(this, input, init);
+    } catch (networkErr: any) {
+      if (isAgentRouterUrl(urlStr)) {
+        arDebugLog(`[FetchHook] Initial fetch network error: ${networkErr.message}. Entering retry loop...`);
+        response = new Response(
+          JSON.stringify({ error: { message: networkErr.message || "Network connection dropped" } }),
+          {
+            status: 503,
+            statusText: "Service Unavailable",
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      } else {
+        throw networkErr;
       }
     }
 
-    // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, or temporary unavailability), retry up to 6 times
-    if (urlStr.includes("agentrouter.org")) {
-      for (let attempt = 0; attempt < 10 && !response.ok; attempt++) {
+    // If upstream returns a retryable error on AgentRouter (such as rate limits, thinking mode glitch, temporary unavailability, or SSE error stream), retry up to 10 times
+    if (isAgentRouterUrl(urlStr)) {
+      for (let attempt = 0; attempt <= 10; attempt++) {
         try {
-          const cloned = response.clone();
-          const text = await cloned.text();
-          const lowerText = text.toLowerCase();
+          let isError = !response.ok;
+          let errorText = "";
+          let errorStatus = response.status;
+
+          if (response.ok && response.headers.get("content-type")?.includes("text/event-stream")) {
+            const check = await inspectStreamInitialChunks(response);
+            if (check.isError) {
+              isError = true;
+              errorText = check.errorText;
+              const lowerCheck = errorText.toLowerCase();
+              errorStatus = (lowerCheck.includes("rate limit") || lowerCheck.includes("rate_limit") || lowerCheck.includes("token rate limit")) ? 429 : 400;
+            } else {
+              response = check.response;
+            }
+          } else if (!response.ok) {
+            const cloned = response.clone();
+            errorText = await cloned.text();
+          }
+
+          if (!isError) {
+            const okCookie = extractCookieFromResponse(response);
+            if (okCookie) {
+              lastAgentRouterCookie = okCookie;
+            }
+            return response;
+          }
+
+          const lowerText = errorText.toLowerCase();
 
           const isRateLimit =
-            response.status === 429 ||
+            errorStatus === 429 ||
             lowerText.includes("rate limit") ||
             lowerText.includes("rate_limit") ||
             lowerText.includes("exceeded token rate limit") ||
@@ -1963,49 +2271,106 @@ export function installAgentRouterFetchHook(): void {
             lowerText.includes("rpm");
 
           const isThinking400 =
-            response.status === 400 &&
-            (text.includes("in the thinking mode must be passed back") ||
-              text.includes("content[].thinking") ||
-              text.includes("reasoning_content"));
+            errorStatus === 400 &&
+            (errorText.includes("in the thinking mode must be passed back") ||
+              errorText.includes("content[].thinking") ||
+              errorText.includes("reasoning_content"));
 
           const isDeserialize422 =
-            response.status === 422 ||
+            errorStatus === 422 ||
             lowerText.includes("failed to deserialize") ||
             lowerText.includes("unknown variant") ||
             lowerText.includes("expected one of `text`");
 
           const isWafBlock =
-            (response.status === 500 && (text.includes("sensitive words detected") || text.includes("sensitive_words_detected"))) ||
-            (response.status === 400 && (text.includes("content-blocked") || text.includes("sensitive words detected") || text.includes("sensitive_words_detected")));
+            (errorStatus === 500 && (errorText.includes("sensitive words detected") || errorText.includes("sensitive_words_detected"))) ||
+            (errorStatus === 400 && (errorText.includes("content-blocked") || errorText.includes("sensitive words detected") || errorText.includes("sensitive_words_detected")));
 
           const isWafChallenge405 =
-            response.status === 405 ||
-            (response.status === 400 && lowerText.includes("blocked") && !isThinking400 && !isWafBlock);
+            errorStatus === 405 ||
+            (errorStatus === 400 && lowerText.includes("blocked") && !isThinking400 && !isWafBlock);
 
           const isServiceUnavailable =
-            (response.status === 500 && text.includes("temporarily unavailable")) ||
-            response.status === 502 ||
-            response.status === 503 ||
-            response.status === 504;
+            (errorStatus === 500 && errorText.includes("temporarily unavailable")) ||
+            errorStatus === 502 ||
+            errorStatus === 503 ||
+            errorStatus === 504;
 
           const isToolPairing400 =
-            response.status === 400 &&
+            errorStatus === 400 &&
             (lowerText.includes("tool_result block must have a corresponding tool_use block") ||
               (lowerText.includes("unexpected") && lowerText.includes("tool_use_id")) ||
               (lowerText.includes("tool_result") && lowerText.includes("tool_use")));
 
-          const shouldRetry = isRateLimit || isThinking400 || isDeserialize422 || isWafBlock || isWafChallenge405 || isServiceUnavailable || isToolPairing400;
+          const isDecryptionOrCrossResourceError =
+            (errorStatus === 500 || errorStatus === 502 || errorStatus === 400 || errorStatus === 503) &&
+            (lowerText.includes("different azure openai resource") ||
+              lowerText.includes("different azure resource") ||
+              lowerText.includes("use the same resource") ||
+              lowerText.includes("could not be decrypted") ||
+              lowerText.includes("encrypted content") ||
+              lowerText.includes("decryption failure") ||
+              lowerText.includes("decryption_failure") ||
+              lowerText.includes("cross-resource") ||
+              lowerText.includes("cross resource") ||
+              lowerText.includes("cross_resource") ||
+              lowerText.includes("cross-origin"));
 
-          if (!shouldRetry) break;
+          const shouldRetry =
+            isRateLimit ||
+            isThinking400 ||
+            isDeserialize422 ||
+            isWafBlock ||
+            isWafChallenge405 ||
+            isServiceUnavailable ||
+            isToolPairing400 ||
+            isDecryptionOrCrossResourceError;
 
-          arDebugLog(`[FetchHook] Caught retryable upstream ${response.status}: ${text.slice(0, 100)}. Retrying attempt ${attempt + 1}...`);
+          if (!shouldRetry || attempt === 10) {
+            if (response.ok && isError) {
+              let cleanMsg = errorText || "Upstream stream error";
+              try {
+                const match = errorText.match(/\{[\s\S]*\}/);
+                if (match) {
+                  const parsed = JSON.parse(match[0]);
+                  cleanMsg = parsed.error?.message || parsed.response?.error?.message || parsed.message || cleanMsg;
+                }
+              } catch {}
+              response = new Response(
+                JSON.stringify({
+                  error: {
+                    message: cleanMsg,
+                    type: isRateLimit ? "rate_limit_error" : "invalid_request_error",
+                    code: isRateLimit ? "rate_limit_exceeded" : null,
+                  },
+                }),
+                {
+                  status: isRateLimit ? 429 : 400,
+                  headers: { "Content-Type": "application/json" },
+                }
+              );
+            }
+            break;
+          }
+
+          if (isRateLimit || isDecryptionOrCrossResourceError) {
+            lastRateLimitTime = Date.now();
+            rateLimitSalt++;
+          }
+
+          arDebugLog(`[FetchHook] Caught retryable upstream ${errorStatus} (attempt ${attempt + 1}/10): ${errorText.slice(0, 100)}. Retrying...`);
 
           lastAgentRouterCookie = "";
           if (init?.headers) {
             removeHeader(init.headers, "cookie");
             removeHeader(init.headers, "x-session-affinity");
-            removeHeader(init.headers, "session_id");
-            removeHeader(init.headers, "x-client-request-id");
+            removeHeader(init.headers, "affinity");
+            const origSessionId = getHeader(init.headers, "session_id");
+            if (origSessionId) {
+              const baseSessionId = origSessionId.replace(/-rl\d+$/, "").replace(/-r\d+$/, "");
+              setHeader(init.headers, "session_id", `${baseSessionId}-r${attempt + 1}`);
+            }
+            setHeader(init.headers, "x-client-request-id", crypto.randomUUID());
           }
 
           // Clean payload if it contained problematic structures (e.g. body.thinking or WAF poison)
@@ -2018,6 +2383,23 @@ export function installAgentRouterFetchHook(): void {
                 if (isDeepSeekModel && "thinking" in bodyObj) {
                   delete bodyObj.thinking;
                 }
+                const isResponses = urlStr.includes("/responses") || (Array.isArray(bodyObj.input) && !Array.isArray(bodyObj.messages));
+                if (isResponses || isDecryptionOrCrossResourceError || isRateLimit) {
+                  if (Array.isArray(bodyObj.input)) {
+                    sanitizeResponsesInput(bodyObj.input);
+                  }
+                  if ("previous_response_id" in bodyObj) {
+                    delete bodyObj.previous_response_id;
+                  }
+                  if ("prompt_cache_key" in bodyObj) {
+                    if (typeof bodyObj.prompt_cache_key === "string") {
+                      const baseKey = bodyObj.prompt_cache_key.replace(/-v\d+$/, "");
+                      bodyObj.prompt_cache_key = `${baseKey}-v${rateLimitSalt || attempt + 1}`;
+                    } else {
+                      delete bodyObj.prompt_cache_key;
+                    }
+                  }
+                }
                 const msgs = Array.isArray(bodyObj.messages) ? bodyObj.messages : bodyObj.input;
                 if (Array.isArray(msgs)) {
                   if (isWafBlock) {
@@ -2025,9 +2407,11 @@ export function installAgentRouterFetchHook(): void {
                     triggerEscalation(true);
                     applyPoisonRedaction(bodyObj);
                   }
-                  normalizeMessagesForAgentRouter(msgs, isDeepSeekModel);
-                  if (isDeepSeekModel) {
-                    frameUserTurnsForDeepSeek(msgs);
+                  if (!isResponses) {
+                    normalizeMessagesForAgentRouter(msgs, isDeepSeekModel);
+                    if (isDeepSeekModel) {
+                      frameUserTurnsForDeepSeek(msgs);
+                    }
                   }
                 }
                 init.body = JSON.stringify(bodyObj);
@@ -2038,29 +2422,49 @@ export function installAgentRouterFetchHook(): void {
             } catch {}
           }
 
-          let waitMs = Math.max(activeMinIntervalMs, 1500) + Math.floor(Math.random() * 600) + attempt * 200;
-          if (isWafChallenge405) {
-            waitMs = Math.max(activeMinIntervalMs, 2500) + attempt * 500 + Math.floor(Math.random() * 500);
-          } else if (isRateLimit) {
+          let waitMs: number;
+          if (isRateLimit) {
             const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
             const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
+            const match = errorText.match(/retry after (\d+) seconds?/i) || errorText.match(/retry in (\d+) seconds?/i);
+            const parsedMatchSec = match ? parseInt(match[1], 10) : 0;
+
+            const baseRetrySec = retryAfterSec || parsedMatchSec;
             if (retryAfterMs > 0) {
-              waitMs = Math.min(retryAfterMs, 8000);
-            } else if (retryAfterSec > 0) {
-              waitMs = Math.min(retryAfterSec * 1000, 8000);
+              waitMs = Math.min(60000, Math.round(retryAfterMs * Math.pow(1.5, attempt)));
+            } else if (baseRetrySec > 0) {
+              waitMs = Math.min(60000, Math.round(baseRetrySec * 1000 * Math.pow(1.5, attempt)));
             } else {
-              const match = text.match(/retry after (\d+) seconds?/i);
-              if (match) {
-                waitMs = Math.min(parseInt(match[1], 10) * 1000, 8000);
-              } else {
-                waitMs = (attempt + 1) * 1500;
-              }
+              // Exponential backoff for TPM / Rate limits: ~5s -> ~8s -> ~12s -> ~18s -> ~28s -> ~44s (cap 60s)
+              const baseWait = Math.max(activeMinIntervalMs, 4000);
+              waitMs = Math.min(60000, Math.round(baseWait * Math.pow(1.6, attempt) + Math.floor(Math.random() * 2000)));
             }
+          } else if (isWafChallenge405) {
+            // WAF 405 challenge: progressive exponential backoff
+            const baseWait = Math.max(activeMinIntervalMs, 3000);
+            waitMs = Math.min(30000, Math.round(baseWait * Math.pow(1.5, attempt) + Math.floor(Math.random() * 1000)));
+          } else {
+            // General upstream errors (500, 502, 503, cross-resource, thinking mode 400, etc.)
+            const baseWait = Math.max(activeMinIntervalMs, 2000);
+            waitMs = Math.min(30000, Math.round(baseWait * Math.pow(1.4, attempt) + Math.floor(Math.random() * 800)));
           }
 
+          arDebugLog(`[FetchHook] Waiting ${Math.round(waitMs / 1000)}s before retry attempt ${attempt + 1}...`);
           await new Promise((resolve) => setTimeout(resolve, waitMs));
           setLastRequestEndTime(Date.now());
-          response = await originalFetch.call(this, input, init);
+          try {
+            response = await originalFetch.call(this, input, init);
+          } catch (retryNetworkErr: any) {
+            arDebugLog(`[FetchHook] Retry attempt ${attempt + 1} network error: ${retryNetworkErr.message}`);
+            response = new Response(
+              JSON.stringify({ error: { message: retryNetworkErr.message || "Network connection dropped" } }),
+              {
+                status: 503,
+                statusText: "Service Unavailable",
+                headers: { "Content-Type": "application/json" },
+              }
+            );
+          }
         } catch (err: any) {
           arDebugLog(`[FetchHook] Retry loop error: ${err?.message || err}`);
           break;
@@ -2068,7 +2472,7 @@ export function installAgentRouterFetchHook(): void {
       }
     }
 
-    if (urlStr.includes("agentrouter.org")) {
+    if (isAgentRouterUrl(urlStr)) {
       const okCookie = extractCookieFromResponse(response);
       if (okCookie) {
         lastAgentRouterCookie = okCookie;
@@ -2076,7 +2480,7 @@ export function installAgentRouterFetchHook(): void {
     }
 
     // Log and handle non-OK responses from upstream
-    if (urlStr.includes("agentrouter.org") && !response.ok) {
+    if (isAgentRouterUrl(urlStr) && !response.ok) {
       try {
         const cloned = response.clone();
         const text = await cloned.text();
@@ -2189,34 +2593,36 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    if (!apiPricing || apiPricing.length === 0) {
-      for (const [id, spec] of Object.entries(KNOWN_MODEL_SPECS)) {
-        if (DECOMMISSIONED_MODEL_IDS.has(id)) continue;
-        if (!processed.has(id)) {
-          const modelObj: any = {
-            id: spec.id,
-            name: spec.name,
-            reasoning: spec.reasoning,
-            input: spec.input || ["text"],
-            contextWindow: spec.contextWindow,
-            maxTokens: spec.maxTokens,
-            cost: spec.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-            compat: spec.compat || { sendSessionAffinityHeaders: true },
-          };
-          if (spec.thinkingLevelMap) {
-            modelObj.thinkingLevelMap = { ...spec.thinkingLevelMap };
-          }
-          if (spec.api) {
-            modelObj.api = spec.api;
-          }
-          if (spec.headers) {
-            modelObj.headers = { ...spec.headers };
-          }
-          if (spec.providerType === "anthropic") {
-            claudeModels.push(modelObj);
-          } else {
-            openaiModels.push(modelObj);
-          }
+    // Register any known non-decommissioned models that were not in live pricing
+    // (e.g. deepseek-v4-flash when temporarily unlisted on gateway) so that settings.json
+    // and enabledModels do not trigger "No models match pattern" warnings.
+    for (const [id, spec] of Object.entries(KNOWN_MODEL_SPECS)) {
+      if (DECOMMISSIONED_MODEL_IDS.has(id)) continue;
+      if (!processed.has(id)) {
+        processed.add(id);
+        const modelObj: any = {
+          id: spec.id,
+          name: spec.name,
+          reasoning: spec.reasoning,
+          input: spec.input || ["text"],
+          contextWindow: spec.contextWindow,
+          maxTokens: spec.maxTokens,
+          cost: spec.cost || { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          compat: spec.compat || { sendSessionAffinityHeaders: true },
+        };
+        if (spec.thinkingLevelMap) {
+          modelObj.thinkingLevelMap = { ...spec.thinkingLevelMap };
+        }
+        if (spec.api) {
+          modelObj.api = spec.api;
+        }
+        if (spec.headers) {
+          modelObj.headers = { ...spec.headers };
+        }
+        if (spec.providerType === "anthropic") {
+          claudeModels.push(modelObj);
+        } else {
+          openaiModels.push(modelObj);
         }
       }
     }
@@ -2327,22 +2733,32 @@ export default function (pi: ExtensionAPI) {
           applyPoisonRedaction(payload);
         }
 
-        const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
-        if (Array.isArray(messages) && messages.length > 0) {
+        const isResponses = Array.isArray(payload.input) && !Array.isArray(payload.messages);
+        if (isResponses) {
           if (isAR) {
-            normalizeMessagesForAgentRouter(messages, isDeepSeek);
-
-            if (isDeepSeek) {
-              frameUserTurnsForDeepSeek(messages);
+            sanitizeResponsesInput(payload.input);
+            if ("previous_response_id" in payload) {
+              delete payload.previous_response_id;
             }
+          }
+        } else {
+          const messages = Array.isArray(payload.messages) ? payload.messages : payload.input;
+          if (Array.isArray(messages) && messages.length > 0) {
+            if (isAR) {
+              normalizeMessagesForAgentRouter(messages, isDeepSeek);
 
-            const firstMsg = messages[0];
-            if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
-              firstMsg.role = "system";
-              if (typeof firstMsg.content === "string") {
-                firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
-              } else if (Array.isArray(firstMsg.content)) {
-                firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+              if (isDeepSeek) {
+                frameUserTurnsForDeepSeek(messages);
+              }
+
+              const firstMsg = messages[0];
+              if (firstMsg && (firstMsg.role === "system" || firstMsg.role === "developer")) {
+                firstMsg.role = "system";
+                if (typeof firstMsg.content === "string") {
+                  firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+                } else if (Array.isArray(firstMsg.content)) {
+                  firstMsg.content = enforceCanonicalRootPrompt(firstMsg.content);
+                }
               }
             }
           }
@@ -2350,6 +2766,9 @@ export default function (pi: ExtensionAPI) {
       }
       if (isAR && Array.isArray(payload.tools) && payload.tools.length > 0) {
         sanitizeOpenAiTools(payload.tools);
+      }
+      if (isAR && Array.isArray(payload.input)) {
+        sanitizeResponsesInput(payload.input);
       }
     }
     return payload;
@@ -2700,10 +3119,11 @@ export default function (pi: ExtensionAPI) {
                 (p.supported_endpoint_types.includes("anthropic") && !p.supported_endpoint_types.includes("openai")),
             }))
           : [
-              { id: "deepseek-v4-flash", isAnthropic: false },
-              { id: "gpt-6-astra", isAnthropic: false },
               { id: "gpt-6.1-sol", isAnthropic: false },
+              { id: "gpt-6-astra", isAnthropic: false },
+              { id: "gpt-5.6-sol", isAnthropic: false },
               { id: "claude-opus-5-5", isAnthropic: true },
+              { id: "deepseek-v4-flash", isAnthropic: false },
             ];
 
         const probeResults = await Promise.all(
@@ -2717,21 +3137,29 @@ export default function (pi: ExtensionAPI) {
           report += `- Token status: Active\n\n`;
         }
 
+        let hasNotInToken = false;
         report += `Model Status:\n`;
         for (const res of probeResults) {
           if (res.status === "READY") {
             report += `  🟢 ${res.model.padEnd(20)}: Ready (200 OK - Quota available)\n`;
           } else if (res.status === "QUOTA_EXHAUSTED") {
             report += `  ⏳ ${res.model.padEnd(20)}: Batch Quota Exhausted (402) - Next batch drop soon\n`;
+          } else if (res.status === "NOT_IN_TOKEN") {
+            hasNotInToken = true;
+            report += `  🔑 ${res.model.padEnd(20)}: Not Added to Token (403) - Enable in dashboard\n`;
           } else if (res.status === "FORBIDDEN") {
             report += `  🔴 ${res.model.padEnd(20)}: Forbidden (403) - Token has no permissions\n`;
           } else {
-            report += `  ⚠️ ${res.model.padEnd(20)}: Error (${res.code}) ${res.message ? "- " + res.message : ""}\n`;
+            report += `  ⚠️ ${res.model.padEnd(20)}: ${res.message || "Error (" + res.code + ")"}\n`;
           }
         }
 
+        if (hasNotInToken) {
+          report += `\n🔑 To enable missing models: go to agentrouter.org -> Tokens (令牌), edit your token and select them to grant access.\n`;
+        }
+
         report +=
-          `\nTip: Claude and GPT models use daily batch quotas. If exhausted, switch to DeepSeek V4 Flash which has unlimited availability.`;
+          `\nTip: gpt-6.1-sol has unlimited all-day availability. Quotas refresh daily for Claude Opus 5.5 (09:00 Beijing) and GPT-6 Astra (03:00 & 15:00 Beijing).`;
 
         ctx.ui.notify(report, "info");
         return;
@@ -2755,7 +3183,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.3.3]\n` +
+        `[AgentRouter Plugin v2.4.0]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +
