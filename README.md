@@ -24,20 +24,20 @@ If you configure AgentRouter as a generic OpenAI or Anthropic endpoint in Pi, yo
 
 AgentRouter is completely free to use and does not accept paid top-ups. Compute is distributed via signup bonuses and daily logins:
 
-- **$50 signup credit:** If you register through [this referral link](https://agentrouter.org/register?aff=34dc), you get $50 in free credit instead of starting at $0. (It also gives me test credits to maintain this plugin).
+- **Up to $250 in welcome credits:** New accounts receive a generous starting balance of up to **$200** from the platform, plus an extra **+$50.00** bonus when registering through [this referral link](https://agentrouter.org/register?aff=34dc) (or enter code `34dc`). Using the referral link also grants test credits to the plugin maintainer. You can also register directly at [agentrouter.org](https://agentrouter.org).
+- **GitHub account requirement:** To prevent bot abuse, AgentRouter strictly requires a **GitHub account older than 1 year (365+ days)** for OAuth registration.
 - **$25 daily login bonus:** You get an extra $25 credit automatically every day upon logging in. If you stay logged in from yesterday, just log out and back in once to collect it.
 - **Quota refresh times:** `gpt-6.1-sol` has unlimited all-day availability. Batch quotas for Claude Opus 5.5 refresh daily at 09:00 Beijing time (04:00 MSK / 01:00 UTC), and GPT-6 Astra refreshes at 03:00 and 15:00 Beijing time (22:00 and 10:00 MSK / 19:00 and 07:00 UTC).
 
-👉 **[Register on AgentRouter (with $50 bonus)](https://agentrouter.org/register?aff=34dc)**  
-*(Referral code `34dc` is attached automatically, whether registering directly or via GitHub OAuth).*
+👉 **[Register directly](https://agentrouter.org)** or **[Register with +$50 bonus (supports plugin maintainer)](https://agentrouter.org/register?aff=34dc)**
 
 ---
 
 ## Quick Start
 
-### 1. Get an API key (Free $50 on Registration)
+### 1. Get an API key
 
-Create an account at [agentrouter.org/register?aff=34dc](https://agentrouter.org/register?aff=34dc) to claim your instant $50 welcome credits, and copy your `sk-...` key from the dashboard.
+Sign in with an eligible GitHub account (> 1 year old) at [agentrouter.org](https://agentrouter.org) (or use [this link with +$50 bonus](https://agentrouter.org/register?aff=34dc) to support the maintainer). In the dashboard, go to **Tokens**, click **Add Token**, select your models, and copy your `sk-...` key.
 
 ### 2. Install the extension
 
@@ -142,7 +142,7 @@ DeepSeek charges ~$0.014 per 1M cached input tokens versus ~$0.14 for uncached o
 
 #### How do free credits and daily check-ins work?
 AgentRouter is completely free and does not accept paid top-ups. Compute is distributed via welcome bonuses and daily rewards:
-- **Registration Bonus:** You receive **$50.00** in free balance upon registration when using the [community referral link](https://agentrouter.org/register?aff=34dc) (versus $0 on plain direct signup).
+- **Welcome Bonus (up to $250):** Eligible new accounts receive up to **$200** in base welcome balance. Using the [optional referral link](https://agentrouter.org/register?aff=34dc) adds an additional **+$50.00** starting bonus and grants test credits to the plugin maintainer. *(Note: Registration requires a **GitHub account older than 1 year** to prevent bot abuse).*
 - **Daily Login Check-In:** The platform uses automatic login check-in (`登录签到`). You receive **$25.00** every day upon logging in (no manual button required). If you remain logged in from the previous day, simply log out and back in to trigger the daily check-in (*"签到成功，新增额度已到账"*).
 - **Quota Drops:** `gpt-6.1-sol` is available all day. Quotas for Claude Opus 5.5 refresh daily in batches at **09:00 Beijing time** (04:00 MSK / 01:00 UTC), and GPT-6 Astra refreshes at **03:00** and **15:00 Beijing time** (22:00 and 10:00 MSK / 19:00 and 07:00 UTC).
 
