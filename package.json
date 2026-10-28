@@ -1,6 +1,6 @@
 {
   "name": "@madgagarin/pi-agentrouter",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Official Pi Coding Agent extension for AgentRouter (agentrouter.org). Connects GPT-6 Astra, GPT-6.1 Sol, GPT-5.6 Sol, Claude Opus 5.5, and DeepSeek V4 Flash with live USD pricing, auto-sync settings, batch quota probe, prompt caching, in-flight WAF auto-recovery, and resilient retries.",
   "publishConfig": {
     "access": "public"

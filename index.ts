@@ -2316,6 +2316,12 @@ export function installAgentRouterFetchHook(): void {
               lowerText.includes("cross_resource") ||
               lowerText.includes("cross-origin"));
 
+          const isTransientAuthError =
+            errorStatus === 401 &&
+            (errorText.includes("无效的令牌") ||
+              (lowerText.includes("new_api_error") && lowerText.includes("token"))) &&
+            attempt < 2;
+
           const shouldRetry =
             isRateLimit ||
             isThinking400 ||
@@ -2324,7 +2330,8 @@ export function installAgentRouterFetchHook(): void {
             isWafChallenge405 ||
             isServiceUnavailable ||
             isToolPairing400 ||
-            isDecryptionOrCrossResourceError;
+            isDecryptionOrCrossResourceError ||
+            isTransientAuthError;
 
           if (!shouldRetry || attempt === 10) {
             if (response.ok && isError) {
@@ -2443,6 +2450,10 @@ export function installAgentRouterFetchHook(): void {
             // WAF 405 challenge: progressive exponential backoff
             const baseWait = Math.max(activeMinIntervalMs, 3000);
             waitMs = Math.min(30000, Math.round(baseWait * Math.pow(1.5, attempt) + Math.floor(Math.random() * 1000)));
+          } else if (isTransientAuthError) {
+            // Transient New-API token cache miss / DB reload (max 2 quick attempts)
+            const baseWait = 1500;
+            waitMs = Math.round(baseWait * Math.pow(1.5, attempt) + Math.floor(Math.random() * 500));
           } else {
             // General upstream errors (500, 502, 503, cross-resource, thinking mode 400, etc.)
             const baseWait = Math.max(activeMinIntervalMs, 2000);
