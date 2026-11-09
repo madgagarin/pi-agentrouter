@@ -434,7 +434,7 @@ export function getPiUserAgent(): string {
   try {
     return `pi (${os.platform()} ${os.release()}; ${os.arch()})`;
   } catch {
-    return "pi (browser)";
+    return "pi-coding-agent";
   }
 }
 
@@ -844,6 +844,7 @@ export let exhausted = false;
 export let sessionAnchor: string | null = null;
 export let wafNotified = false;
 export let lastWafBlockTime = 0;
+export let streamCrashRetryCount = 0;
 export let activeMinIntervalMs = 3500;
 try {
   const cfg = loadConfig();
@@ -860,6 +861,7 @@ export function resetPoisonRedactionState(): void {
   sessionAnchor = null;
   wafNotified = false;
   lastWafBlockTime = 0;
+  streamCrashRetryCount = 0;
 }
 
 export function triggerEscalation(sensitive: boolean = false): void {
@@ -1680,10 +1682,28 @@ export async function fetchTokenUsage(apiKey: string): Promise<number | null> {
     if (!res.ok) return null;
     const data = await res.json();
     if (data && typeof data.total_usage === "number") {
-      return data.total_usage;
+      // New-API / One-API returns usage quota units where $1.00 USD = 500,000 units
+      return data.total_usage / 500000;
     }
   } catch {}
   return null;
+}
+
+export function getBeijingCountdown(targetHours: number[]): string {
+  const now = new Date();
+  const beijingMs = now.getTime() + 8 * 3600 * 1000;
+  const beijingDate = new Date(beijingMs);
+  const curTotalMin = beijingDate.getUTCHours() * 60 + beijingDate.getUTCMinutes();
+
+  let minDiff = Infinity;
+  for (const th of targetHours) {
+    let diff = th * 60 - curTotalMin;
+    if (diff <= 0) diff += 24 * 60;
+    if (diff < minDiff) minDiff = diff;
+  }
+  const h = Math.floor(minDiff / 60);
+  const m = minDiff % 60;
+  return `${h}h ${m}m`;
 }
 
 export interface ModelProbeResult {
@@ -1804,6 +1824,41 @@ function arDebugLog(msg: string): void {
 
 export let lastAgentRouterCookie = "";
 export let activeAgentRouterThinkingFormat: "openai" | "claude" = "openai";
+export let activeExtensionContext: any = null;
+export let activeExtensionApi: ExtensionAPI | null = null;
+
+export function setActiveExtensionContext(ctx: any): void {
+  activeExtensionContext = ctx;
+}
+
+export function setActiveExtensionApi(api: ExtensionAPI | null): void {
+  activeExtensionApi = api;
+}
+
+export async function safeResumeTurn(promptText: string = "Continue"): Promise<void> {
+  if (!activeExtensionApi) return;
+  await new Promise((r) => setTimeout(r, 500));
+
+  if (activeExtensionContext?.waitForIdle) {
+    try {
+      await Promise.race([
+        activeExtensionContext.waitForIdle(),
+        new Promise((r) => setTimeout(r, 2000)),
+      ]);
+    } catch {}
+  }
+
+  try {
+    await (activeExtensionApi as any).sendUserMessage(promptText, { deliverAs: "followUp" });
+  } catch (err: any) {
+    arDebugLog(`[safeResumeTurn] error with deliverAs: ${err?.message || err}`);
+    try {
+      await (activeExtensionApi as any).sendUserMessage(promptText);
+    } catch (e: any) {
+      arDebugLog(`[safeResumeTurn] fallback error: ${e?.message || e}`);
+    }
+  }
+}
 
 export function getActiveAgentRouterThinkingFormat(): "openai" | "claude" {
   return "openai";
@@ -1902,6 +1957,11 @@ export function getHeader(headers: unknown, name: string): string | undefined {
   return undefined;
 }
 
+export function isWhitelistedAgentRouterUa(ua: string | null | undefined): boolean {
+  if (typeof ua !== "string" || !ua) return false;
+  return ua.startsWith("pi (") || ua === "pi-coding-agent" || ua.startsWith("opencode/");
+}
+
 export function setHeader(headers: unknown, name: string, value: string): void {
   if (!headers) return;
   const target = name.toLowerCase();
@@ -1910,23 +1970,37 @@ export function setHeader(headers: unknown, name: string, value: string): void {
     return;
   }
   if (Array.isArray(headers)) {
-    for (let i = 0; i < headers.length; i++) {
+    let replaced = false;
+    for (let i = headers.length - 1; i >= 0; i--) {
       if (typeof headers[i][0] === "string" && headers[i][0].toLowerCase() === target) {
-        headers[i][1] = value;
-        return;
+        if (!replaced) {
+          headers[i][1] = value;
+          replaced = true;
+        } else {
+          headers.splice(i, 1);
+        }
       }
     }
-    headers.push([name, value]);
+    if (!replaced) {
+      headers.push([name, value]);
+    }
     return;
   }
   if (typeof headers === "object") {
+    let setKey: string | null = null;
     for (const k of Object.keys(headers)) {
       if (k.toLowerCase() === target) {
-        (headers as Record<string, any>)[k] = value;
-        return;
+        if (!setKey) {
+          setKey = k;
+          (headers as Record<string, any>)[k] = value;
+        } else {
+          delete (headers as Record<string, any>)[k];
+        }
       }
     }
-    (headers as Record<string, any>)[name] = value;
+    if (!setKey) {
+      (headers as Record<string, any>)[name] = value;
+    }
   }
 }
 
@@ -1954,20 +2028,54 @@ export function removeHeader(headers: unknown, name: string): void {
   }
 }
 
+export function patchSseResponseFailed(text: string): string {
+  if (!text.includes("response.failed") && !text.includes('"status":"failed"')) {
+    return text;
+  }
+  if (text.includes('"error":{') || text.includes('"error": {')) {
+    return text;
+  }
+  return text.replace(
+    /("status"\s*:\s*"failed")(\s*[,}])/g,
+    `$1,"error":{"code":"upstream_cluster_crash","message":"AgentRouter upstream model aborted generation mid-stream (empty error from Azure/OpenAI cluster)"}$2`
+  );
+}
+
 export function wrapStreamWithBuffer(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   buffered: Uint8Array[]
 ): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (buffered.length > 0) {
-        controller.enqueue(buffered.shift()!);
+        const raw = buffered.shift()!;
+        try {
+          const text = decoder.decode(raw, { stream: true });
+          const patched = patchSseResponseFailed(text);
+          if (patched !== text) {
+            controller.enqueue(encoder.encode(patched));
+            return;
+          }
+        } catch {}
+        controller.enqueue(raw);
         return;
       }
       const { value, done } = await reader.read();
       if (done) {
         controller.close();
       } else {
+        if (value && value.length > 0) {
+          try {
+            const text = decoder.decode(value, { stream: true });
+            const patched = patchSseResponseFailed(text);
+            if (patched !== text) {
+              controller.enqueue(encoder.encode(patched));
+              return;
+            }
+          } catch {}
+        }
         controller.enqueue(value);
       }
     },
@@ -2090,42 +2198,35 @@ export function installAgentRouterFetchHook(): void {
   globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request)?.url || "";
 
+    const callFetch = async (fetchInput: RequestInfo | URL, fetchInit?: RequestInit): Promise<Response> => {
+      let finalInput = fetchInput;
+      if (typeof fetchInput !== "string" && !(fetchInput instanceof URL) && typeof (fetchInput as any)?.clone === "function") {
+        try {
+          finalInput = (fetchInput as any).clone();
+        } catch {}
+      }
+      return originalFetch.call(this, finalInput, fetchInit);
+    };
+
     if (isAgentRouterUrl(urlStr)) {
       const piUa = getPiUserAgent();
+      if (typeof input !== "string" && !(input instanceof URL) && "headers" in input && (input as any).headers instanceof Headers) {
+        const reqHeaders = (input as Request).headers;
+        const currentReqUa = reqHeaders.get("user-agent");
+        if (!isWhitelistedAgentRouterUa(currentReqUa)) {
+          reqHeaders.set("User-Agent", piUa);
+        }
+      }
       if (!init) {
-        init = { headers: { "User-Agent": piUa } };
+        if (typeof input === "string" || input instanceof URL) {
+          init = { headers: { "User-Agent": piUa } };
+        }
       } else if (!init.headers) {
         init.headers = { "User-Agent": piUa };
-      } else if (init.headers instanceof Headers) {
-        const currentUa = init.headers.get("User-Agent") || "";
-        if (!currentUa.startsWith("pi (") && !currentUa.startsWith("pi/")) {
-          init.headers.set("User-Agent", piUa);
-        }
-      } else if (Array.isArray(init.headers)) {
-        let found = false;
-        for (const pair of init.headers) {
-          if (pair[0].toLowerCase() === "user-agent") {
-            found = true;
-            if (!pair[1].startsWith("pi (") && !pair[1].startsWith("pi/")) {
-              pair[1] = piUa;
-            }
-          }
-        }
-        if (!found) {
-          init.headers.push(["User-Agent", piUa]);
-        }
-      } else if (typeof init.headers === "object") {
-        let foundUa = false;
-        for (const [k, v] of Object.entries(init.headers)) {
-          if (k.toLowerCase() === "user-agent") {
-            foundUa = true;
-            if (typeof v !== "string" || (!v.startsWith("pi (") && !v.startsWith("pi/"))) {
-              (init.headers as any)[k] = piUa;
-            }
-          }
-        }
-        if (!foundUa) {
-          (init.headers as any)["User-Agent"] = piUa;
+      } else {
+        const currentUa = getHeader(init.headers, "User-Agent");
+        if (!isWhitelistedAgentRouterUa(currentUa)) {
+          setHeader(init.headers, "User-Agent", piUa);
         }
       }
 
@@ -2210,7 +2311,7 @@ export function installAgentRouterFetchHook(): void {
 
     let response: Response;
     try {
-      response = await originalFetch.call(this, input, init);
+      response = await callFetch(input, init);
     } catch (networkErr: any) {
       if (isAgentRouterUrl(urlStr)) {
         arDebugLog(`[FetchHook] Initial fetch network error: ${networkErr.message}. Entering retry loop...`);
@@ -2322,8 +2423,70 @@ export function installAgentRouterFetchHook(): void {
               (lowerText.includes("new_api_error") && lowerText.includes("token"))) &&
             attempt < 2;
 
+          const isUnauthorizedClient401 =
+            errorStatus === 401 &&
+            (lowerText.includes("unauthorized client") || lowerText.includes("unauthorized_client_error")) &&
+            attempt < 3;
+
+          const isQuota402 =
+            errorStatus === 402 ||
+            (errorStatus === 403 && (lowerText.includes("quota") || lowerText.includes("额度") || lowerText.includes("无权访问模型"))) ||
+            lowerText.includes("quota exhausted") ||
+            lowerText.includes("budget pool");
+
+          let switchedOnQuota = false;
+          if (isQuota402 && attempt === 0 && activeExtensionContext?.hasUI) {
+            let currentModelId = "";
+            if (init && typeof init.body === "string") {
+              try {
+                const parsed = JSON.parse(init.body);
+                currentModelId = parsed.model || "";
+              } catch {}
+            }
+            if (!currentModelId) currentModelId = activeExtensionContext?.model?.id || "модель";
+
+            if (currentModelId !== "gpt-6.1-sol") {
+              const quotaOptions = [
+                "🔀 Переключиться на gpt-6.1-sol (безлимитно)",
+                "⏹️ Остановиться",
+              ];
+              let choice: string | undefined;
+              try {
+                choice = await activeExtensionContext.ui.select(
+                  `[AgentRouter] Исчерпана суточная квота на модель ${currentModelId} (402 Quota Exhausted).`,
+                  quotaOptions
+                );
+              } catch (err: any) {
+                arDebugLog(`[FetchHook] 402 select error: ${err?.message || err}`);
+              }
+
+              if (choice?.startsWith("🔀")) {
+                if (init && typeof init.body === "string") {
+                  try {
+                    const bodyObj = JSON.parse(init.body);
+                    bodyObj.model = "gpt-6.1-sol";
+                    init.body = JSON.stringify(bodyObj);
+                  } catch {}
+                }
+                try {
+                  const newModel = activeExtensionContext.modelRegistry?.find("agentrouter-openai", "gpt-6.1-sol") ||
+                                   activeExtensionContext.modelRegistry?.find("agentrouter", "gpt-6.1-sol");
+                  if (newModel && activeExtensionApi) {
+                    await activeExtensionApi.setModel(newModel);
+                  }
+                } catch {}
+                if (activeExtensionContext?.ui?.notify) {
+                  activeExtensionContext.ui.notify("[AgentRouter] Переключено на безлимитную gpt-6.1-sol. Повторяем запрос...", "info");
+                }
+                switchedOnQuota = true;
+              }
+            }
+          }
+
           const shouldRetry =
+            switchedOnQuota ||
             isRateLimit ||
+            isUnauthorizedClient401 ||
             isThinking400 ||
             isDeserialize422 ||
             isWafBlock ||
@@ -2378,6 +2541,17 @@ export function installAgentRouterFetchHook(): void {
               setHeader(init.headers, "session_id", `${baseSessionId}-r${attempt + 1}`);
             }
             setHeader(init.headers, "x-client-request-id", crypto.randomUUID());
+
+            if (isUnauthorizedClient401) {
+              const fallbackUa = "pi-coding-agent";
+              if (typeof input !== "string" && !(input instanceof URL) && "headers" in input && (input as any).headers instanceof Headers) {
+                (input as Request).headers.set("User-Agent", fallbackUa);
+              }
+              if (init?.headers) {
+                setHeader(init.headers, "User-Agent", fallbackUa);
+              }
+              arDebugLog(`[FetchHook] Unauthorized client 401 detected. Forced User-Agent to '${fallbackUa}' for retry.`);
+            }
           }
 
           // Clean payload if it contained problematic structures (e.g. body.thinking or WAF poison)
@@ -2429,27 +2603,97 @@ export function installAgentRouterFetchHook(): void {
             } catch {}
           }
 
-          let waitMs: number;
-          if (isRateLimit) {
-            const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
-            const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
-            const match = errorText.match(/retry after (\d+) seconds?/i) || errorText.match(/retry in (\d+) seconds?/i);
-            const parsedMatchSec = match ? parseInt(match[1], 10) : 0;
+          let waitMs: number = 0;
+          let shouldStopFromDialog = false;
 
-            const baseRetrySec = retryAfterSec || parsedMatchSec;
-            if (retryAfterMs > 0) {
-              waitMs = Math.min(60000, Math.round(retryAfterMs * Math.pow(1.5, attempt)));
-            } else if (baseRetrySec > 0) {
-              waitMs = Math.min(60000, Math.round(baseRetrySec * 1000 * Math.pow(1.5, attempt)));
+          if (switchedOnQuota) {
+            waitMs = 0;
+          } else if (isRateLimit) {
+            const retryAfterSec = parseInt(response.headers.get("retry-after") || "0", 10);
+
+            // If interactive UI is available and this is either not a tiny 1-3s header or already attempt >= 1:
+            if (activeExtensionContext?.hasUI && (attempt >= 1 || retryAfterSec > 3 || retryAfterSec === 0)) {
+              let currentModelId = "";
+              if (init && typeof init.body === "string") {
+                try {
+                  const parsed = JSON.parse(init.body);
+                  currentModelId = parsed.model || "";
+                } catch {}
+              }
+              if (!currentModelId) currentModelId = activeExtensionContext?.model?.id || "модель";
+
+              const options: string[] = ["⏳ Повторить сейчас"];
+              if (currentModelId !== "gpt-6.1-sol") {
+                options.push("🔀 Переключиться на gpt-6.1-sol (безлимитная)");
+              }
+              options.push("⏹️ Остановиться");
+
+              const startDialogTime = Date.now();
+              let choice: string | undefined;
+              try {
+                choice = await activeExtensionContext.ui.select(
+                  `[AgentRouter] Модель ${currentModelId} временно перегружена (429 Rate Limit).\nАвтоповтор через 60 сек... или выберите действие:`,
+                  options,
+                  { timeout: 60000 }
+                );
+              } catch (uiErr: any) {
+                arDebugLog(`[FetchHook] 429 select error: ${uiErr?.message || uiErr}`);
+              }
+              const elapsedMs = Date.now() - startDialogTime;
+
+              if (choice === "⏳ Повторить сейчас") {
+                waitMs = 0;
+              } else if (choice?.startsWith("🔀")) {
+                if (init && typeof init.body === "string") {
+                  try {
+                    const bodyObj = JSON.parse(init.body);
+                    bodyObj.model = "gpt-6.1-sol";
+                    init.body = JSON.stringify(bodyObj);
+                  } catch {}
+                }
+                try {
+                  const newModel = activeExtensionContext.modelRegistry?.find("agentrouter-openai", "gpt-6.1-sol") ||
+                                   activeExtensionContext.modelRegistry?.find("agentrouter", "gpt-6.1-sol");
+                  if (newModel && activeExtensionApi) {
+                    await activeExtensionApi.setModel(newModel);
+                  }
+                } catch {}
+                if (activeExtensionContext?.ui?.notify) {
+                  activeExtensionContext.ui.notify("[AgentRouter] Переключено на безлимитную gpt-6.1-sol. Продолжаем ход...", "info");
+                }
+                waitMs = 0;
+              } else if (choice?.startsWith("⏹️")) {
+                shouldStopFromDialog = true;
+              } else if (choice === undefined) {
+                if (elapsedMs >= 55000) {
+                  arDebugLog("[FetchHook] 60s dialog timeout expired - auto-retrying...");
+                  waitMs = 0;
+                } else {
+                  arDebugLog("[FetchHook] User cancelled 429 dialog with Escape - stopping.");
+                  shouldStopFromDialog = true;
+                }
+              }
             } else {
-              // Exponential backoff for TPM / Rate limits: ~5s -> ~8s -> ~12s -> ~18s -> ~28s -> ~44s (cap 60s)
-              const baseWait = Math.max(activeMinIntervalMs, 4000);
-              waitMs = Math.min(60000, Math.round(baseWait * Math.pow(1.6, attempt) + Math.floor(Math.random() * 2000)));
+              // Non-UI or short 1-3s header: exponential backoff
+              const retryAfterMs = parseInt(response.headers.get("retry-after-ms") || "0", 10);
+              const match = errorText.match(/retry after (\d+) seconds?/i) || errorText.match(/retry in (\d+) seconds?/i);
+              const parsedMatchSec = match ? parseInt(match[1], 10) : 0;
+              const baseRetrySec = retryAfterSec || parsedMatchSec;
+              if (retryAfterMs > 0) {
+                waitMs = Math.min(60000, Math.round(retryAfterMs * Math.pow(1.5, attempt)));
+              } else if (baseRetrySec > 0) {
+                waitMs = Math.min(60000, Math.round(baseRetrySec * 1000 * Math.pow(1.5, attempt)));
+              } else {
+                const baseWait = Math.max(activeMinIntervalMs, 4000);
+                waitMs = Math.min(60000, Math.round(baseWait * Math.pow(1.6, attempt) + Math.floor(Math.random() * 2000)));
+              }
             }
           } else if (isWafChallenge405) {
             // WAF 405 challenge: progressive exponential backoff
             const baseWait = Math.max(activeMinIntervalMs, 3000);
             waitMs = Math.min(30000, Math.round(baseWait * Math.pow(1.5, attempt) + Math.floor(Math.random() * 1000)));
+          } else if (isUnauthorizedClient401) {
+            waitMs = 300 * (attempt + 1);
           } else if (isTransientAuthError) {
             // Transient New-API token cache miss / DB reload (max 2 quick attempts)
             const baseWait = 1500;
@@ -2460,11 +2704,32 @@ export function installAgentRouterFetchHook(): void {
             waitMs = Math.min(30000, Math.round(baseWait * Math.pow(1.4, attempt) + Math.floor(Math.random() * 800)));
           }
 
-          arDebugLog(`[FetchHook] Waiting ${Math.round(waitMs / 1000)}s before retry attempt ${attempt + 1}...`);
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (shouldStopFromDialog) {
+            if (response.ok && isError) {
+              response = new Response(
+                JSON.stringify({
+                  error: {
+                    message: errorText || "Rate limit exceeded",
+                    type: "rate_limit_error",
+                    code: "rate_limit_exceeded",
+                  },
+                }),
+                {
+                  status: 429,
+                  headers: { "Content-Type": "application/json" },
+                }
+              );
+            }
+            break;
+          }
+
+          if (waitMs > 0) {
+            arDebugLog(`[FetchHook] Waiting ${Math.round(waitMs / 1000)}s before retry attempt ${attempt + 1}...`);
+            await new Promise((resolve) => setTimeout(resolve, waitMs));
+          }
           setLastRequestEndTime(Date.now());
           try {
-            response = await originalFetch.call(this, input, init);
+            response = await callFetch(input, init);
           } catch (retryNetworkErr: any) {
             arDebugLog(`[FetchHook] Retry attempt ${attempt + 1} network error: ${retryNetworkErr.message}`);
             response = new Response(
@@ -2514,6 +2779,7 @@ installAgentRouterFetchHook();
 
 export default function (pi: ExtensionAPI) {
   installAgentRouterFetchHook();
+  setActiveExtensionApi(pi);
   function getEffectiveApiKey(): string {
     const cfg = loadConfig();
     return normalizeApiKey(process.env.AGENTROUTER_API_KEY || process.env.AGENT_ROUTER_API_KEY || cfg.apiKey || "");
@@ -2685,6 +2951,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("before_provider_request", async (event, ctx) => {
+    setActiveExtensionContext(ctx);
     const payload = event.payload;
     const provider = (
       (payload as any)?.provider ||
@@ -2786,12 +3053,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", async (event, ctx) => {
+    setActiveExtensionContext(ctx);
     const message = (event as any)?.message;
     if (!message) return;
 
     if (message.role === "assistant" && message.stopReason !== "error") {
       wafNotified = false;
       isSensitiveBlock = false;
+      streamCrashRetryCount = 0;
     }
 
     const provider = message.provider ?? ctx?.model?.provider;
@@ -2804,6 +3073,168 @@ export default function (pi: ExtensionAPI) {
     if (!isAgentRouter(provider, baseUrl)) return;
 
     const errorMessage = message.errorMessage ?? "";
+
+    // Mid-stream connection drops & server timeouts (e.g. on huge 100k-200k contexts)
+    const isStreamTimeoutOrCrash =
+      errorMessage.includes("Unknown error (no error details in response)") ||
+      errorMessage.includes("upstream_cluster_crash") ||
+      errorMessage.includes("The operation timed out") ||
+      errorMessage.includes("socket connection was closed unexpectedly") ||
+      errorMessage.includes("Network connection dropped");
+
+    if (isStreamTimeoutOrCrash) {
+      const curModel = ctx?.model?.id || (message as any)?.model || "модель";
+      if (!ctx?.hasUI) {
+        if (streamCrashRetryCount >= 2) {
+          if (curModel !== "gpt-6.1-sol") {
+            console.warn(`\n⚠️  [AgentRouter] Сервер ${curModel} оборвал соединение 3 раза подряд (исчерпан лимит токенов / сбой кластера). Автопереключение на gpt-6.1-sol...\n`);
+            try {
+              const newModel = ctx.modelRegistry?.find("agentrouter-openai", "gpt-6.1-sol") ||
+                               ctx.modelRegistry?.find("agentrouter", "gpt-6.1-sol");
+              if (newModel && activeExtensionApi) {
+                await activeExtensionApi.setModel(newModel);
+              }
+            } catch {}
+            streamCrashRetryCount = 0;
+            setTimeout(async () => {
+              await safeResumeTurn("Continue");
+            }, 3000);
+          } else {
+            console.error(`\n❌ [AgentRouter] Сервер ${curModel} оборвал соединение 3 раза подряд. Сессия перегружена — выполните /compact для сжатия истории.\n`);
+          }
+        } else {
+          streamCrashRetryCount++;
+          console.warn(`\n⚠️  [AgentRouter] Сервер ${curModel} оборвал соединение. Автоповтор через 30 сек...\n`);
+          setTimeout(async () => {
+            try {
+              await safeResumeTurn("Continue");
+            } catch (err: any) {
+              arDebugLog(`[message_end] headless auto-continue error: ${err?.message || err}`);
+            }
+          }, 30000);
+        }
+        return;
+      }
+
+      ctx.ui.notify(
+        `[AgentRouter] Сервер ${curModel} оборвал соединение (сбой бэкенда/исчерпан TPM лимит кластера модели). Сбойный ход очищен.`,
+        "warning"
+      );
+
+      const options: string[] = [
+        `⏳ Оставить ${curModel} (продолжить сейчас)`,
+      ];
+      if (curModel !== "gpt-6.1-sol") {
+        options.push("🔀 Переключиться на gpt-6.1-sol (рекомендуется)");
+      }
+      options.push("⏹️ Остановиться");
+
+      let choice: string | undefined;
+      const startDialogTime = Date.now();
+      const abortController = new AbortController();
+      let fallbackTimedOut = false;
+      const timer = setTimeout(() => {
+        fallbackTimedOut = true;
+        abortController.abort();
+        try {
+          const uiAny = ctx.ui as any;
+          if (typeof uiAny?.inputHandler?.onCancel === "function") {
+            uiAny.inputHandler.onCancel();
+          }
+        } catch {}
+      }, 30000);
+
+      try {
+        choice = await ctx.ui.select(
+          `[AgentRouter] Сервер ${curModel} оборвал соединение (попытка ${streamCrashRetryCount + 1}/3). Автоповтор через 30 сек:`,
+          options,
+          { timeout: 30000, signal: abortController.signal }
+        );
+      } catch (err: any) {
+        arDebugLog(`[message_end] select error: ${err?.message || err}`);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      const elapsedMs = Date.now() - startDialogTime;
+
+      if (choice?.startsWith("⏳") || choice?.includes("Оставить") || choice?.includes("текущую модель") || choice?.includes("продолжить")) {
+        streamCrashRetryCount = 0;
+        ctx.ui.notify(`[AgentRouter] Продолжаем генерацию на ${curModel}...`, "info");
+        setTimeout(async () => {
+          try {
+            await safeResumeTurn("Continue");
+          } catch (err: any) {
+            arDebugLog(`[message_end] auto-continue error: ${err?.message || err}`);
+          }
+        }, 100);
+      } else if (choice?.startsWith("🔀")) {
+        streamCrashRetryCount = 0;
+        try {
+          const newModel = ctx.modelRegistry?.find("agentrouter-openai", "gpt-6.1-sol") ||
+                           ctx.modelRegistry?.find("agentrouter", "gpt-6.1-sol");
+          if (newModel && activeExtensionApi) {
+            await activeExtensionApi.setModel(newModel);
+          }
+        } catch {}
+        ctx.ui.notify("[AgentRouter] Переключено на безлимитную gpt-6.1-sol. Продолжаем ход...", "info");
+        setTimeout(async () => {
+          try {
+            await safeResumeTurn("Continue");
+          } catch (err: any) {
+            arDebugLog(`[message_end] auto-continue error: ${err?.message || err}`);
+          }
+        }, 100);
+      } else if (choice?.startsWith("⏹️") || choice?.includes("Остановиться")) {
+        streamCrashRetryCount = 0;
+        ctx.ui.notify("[AgentRouter] Генерация остановлена пользователем.", "info");
+      } else if (choice === undefined) {
+        if (fallbackTimedOut || elapsedMs >= 28000) {
+          if (streamCrashRetryCount >= 2) {
+            if (curModel !== "gpt-6.1-sol") {
+              ctx.ui.notify(
+                `[AgentRouter] Сервер ${curModel} оборвал соединение 3 раза подряд (исчерпан лимит токенов / сбой кластера).\nАвтоматически переключаем на безлимитную gpt-6.1-sol для спасения сессии...`,
+                "warning"
+              );
+              try {
+                const newModel = ctx.modelRegistry?.find("agentrouter-openai", "gpt-6.1-sol") ||
+                                 ctx.modelRegistry?.find("agentrouter", "gpt-6.1-sol");
+                if (newModel && activeExtensionApi) {
+                  await activeExtensionApi.setModel(newModel);
+                }
+              } catch {}
+              streamCrashRetryCount = 0;
+              setTimeout(async () => {
+                try {
+                  await safeResumeTurn("Continue");
+                } catch (err: any) {
+                  arDebugLog(`[message_end] auto-continue error: ${err?.message || err}`);
+                }
+              }, 100);
+            } else {
+              ctx.ui.notify(
+                `[AgentRouter] Сервер ${curModel} оборвал соединение 3 раза подряд. Сессия перегружена — выполните /compact для сжатия истории.`,
+                "error"
+              );
+            }
+          } else {
+            streamCrashRetryCount++;
+            ctx.ui.notify(`[AgentRouter] 30 сек истекли: автоматически продолжаем на ${curModel} (попытка ${streamCrashRetryCount}/3)...`, "info");
+            setTimeout(async () => {
+              try {
+                await safeResumeTurn("Continue");
+              } catch (err: any) {
+                arDebugLog(`[message_end] auto-continue error: ${err?.message || err}`);
+              }
+            }, 100);
+          }
+        } else {
+          ctx.ui.notify("[AgentRouter] Автоповтор отменен пользователем.", "info");
+        }
+      }
+      return;
+    }
+
     const isRecentWaf = Date.now() - lastWafBlockTime < 15000;
     if (!WAF_BLOCK_RE.test(errorMessage) && !isRecentWaf) return;
 
@@ -2848,6 +3279,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (_event, ctx) => {
+    setActiveExtensionContext(ctx);
     const model = ctx?.model;
     if (isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
       setLastRequestEndTime(Date.now());
@@ -2862,6 +3294,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    setActiveExtensionContext(ctx);
     currentApiKey = getEffectiveApiKey();
     resetPoisonRedactionState();
     cleanupDeepSeekDuplicates();
@@ -2912,10 +3345,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    setActiveExtensionContext(ctx);
     updatePromptRewriteEnvForModel(ctx.model);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
+    setActiveExtensionContext(ctx);
     const model = ctx.model;
     updatePromptRewriteEnvForModel(model);
     if (!isAgentRouter(model?.provider, (model as any)?.baseUrl)) {
@@ -3169,8 +3604,12 @@ export default function (pi: ExtensionAPI) {
           report += `\n🔑 To enable missing models: go to agentrouter.org -> Tokens (令牌), edit your token and select them to grant access.\n`;
         }
 
-        report +=
-          `\nTip: gpt-6.1-sol has unlimited all-day availability. Quotas refresh daily for Claude Opus 5.5 (09:00 Beijing) and GPT-6 Astra (03:00 & 15:00 Beijing).`;
+        const astraCountdown = getBeijingCountdown([3, 15]);
+        const opusCountdown = getBeijingCountdown([9]);
+        report += `\nSchedule & Quotas:\n`;
+        report += `  • gpt-6.1-sol: 24/7 unlimited availability (Recommended fallback)\n`;
+        report += `  • gpt-6-astra: next quota drop in ~${astraCountdown} (03:00 / 15:00 Beijing)\n`;
+        report += `  • claude-opus-5-5: next quota drop in ~${opusCountdown} (09:00 Beijing)\n`;
 
         ctx.ui.notify(report, "info");
         return;
@@ -3194,7 +3633,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `[AgentRouter Plugin v2.4.0]\n` +
+        `[AgentRouter Plugin v2.5.0]\n` +
           `- Active model: ${activeModel?.id || "none"} (${isAR ? "AgentRouter [yes]" : "Other Provider"})\n` +
           `- Package Priority: ${priorityStatus}\n` +
           `- API Key: ${maskedKey}\n` +

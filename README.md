@@ -15,8 +15,10 @@ If you configure AgentRouter as a generic OpenAI or Anthropic endpoint in Pi, yo
 1. **Gateway content filters lock up sessions:** AgentRouter's upstream gateway blocks requests containing binary output (such as reading a `.so` or compiled file) or certain keywords with `400 content-blocked` or `500 sensitive words detected`. Because Pi sends previous conversation turns with each request, that error stays in context and every subsequent retry fails. **This extension catches the error, redacts the problematic output from in-memory history, and retries cleanly.**
 2. **Prompt caching errors & extra costs:** Standard Anthropic caching headers (`cache_control`) trigger `400 Bad Request` on non-Anthropic endpoints, and changing prompt prefixes invalidates DeepSeek caches. **This extension enforces prefix stability so DeepSeek and Claude hit ~95% cache rates, cutting token costs by ~90% without throwing 400s.**
 3. **Reasoning mode mismatches & cluster errors:** DeepSeek, Claude, and OpenAI Responses API use fundamentally different schemas for thinking traces. Sending raw thinking payloads or re-sending Azure-encrypted reasoning items (`rs_...`) across AgentRouter's multi-node pool causes `400 Decryption Failure`, `400 Cross-Resource Access`, or `422` validation errors. **This extension normalizes thinking schemas and strips node-bound ciphertext so multi-turn chats run smoothly across any gateway node.**
-4. **Sudden 402 quota errors:** Quotas for batch models are released on schedule (09:00 Beijing for Claude Opus 5.5, 03:00 & 15:00 for GPT-6 Astra). When a batch runs out, the API returns `402`. **Switch to `gpt-6.1-sol` which has all-day unlimited availability, or run `/agentrouter check` to test live status.**
-5. **Subagent & TPM rate limits (429):** Running concurrent subagents or sending heavy multi-turn context can trip AgentRouter's per-minute token limits (TPM). **This extension combines file-based request pacing with in-flight progressive exponential backoff that spans Azure's rolling 60-second quota window.**
+4. **Sudden 402 quota errors:** Quotas for batch models are released on schedule (09:00 Beijing for Claude Opus 5.5, 03:00 & 15:00 for GPT-6 Astra). When a batch runs out, the API returns `402`. **The extension prompts to switch to `gpt-6.1-sol` (unlimited all day) or stop.**
+5. **Subagent & TPM rate limits (429):** Running concurrent subagents or sending heavy multi-turn context can trip AgentRouter's per-minute token limits. **The extension handles backoff and shows a 60s countdown prompt to switch to `gpt-6.1-sol` or retry.**
+6. **Mid-stream connection drops:** When upstream clusters drop connection on heavy contexts (`Unknown error (no error details in response)` / `The operation timed out`), Pi loses the turn. **The extension cleans up the failed turn, offers an interactive 30s auto-retry prompt, and auto-switches to `gpt-6.1-sol` after 3 consecutive drops.**
+7. **Client UA blocking (401 Unauthorized Client):** AgentRouter blocks raw `pi/<version>` headers with `401 unauthorized client detected`. **The extension rewrites User-Agent to whitelisted signatures and auto-retries if an anti-bot check triggers.**
 
 ---
 
@@ -145,6 +147,25 @@ AgentRouter is completely free and does not accept paid top-ups. Compute is dist
 - **Welcome Bonus (up to $250):** Eligible new accounts receive up to **$200** in base welcome balance. Using the [optional referral link](https://agentrouter.org/register?aff=34dc) adds an additional **+$50.00** starting bonus and grants test credits to the plugin maintainer. *(Note: Registration requires a **GitHub account older than 1 year** to prevent bot abuse).*
 - **Daily Login Check-In:** The platform uses automatic login check-in (`登录签到`). You receive **$25.00** every day upon logging in (no manual button required). If you remain logged in from the previous day, simply log out and back in to trigger the daily check-in (*"签到成功，新增额度已到账"*).
 - **Quota Drops:** `gpt-6.1-sol` is available all day. Quotas for Claude Opus 5.5 refresh daily in batches at **09:00 Beijing time** (04:00 MSK / 01:00 UTC), and GPT-6 Astra refreshes at **03:00** and **15:00 Beijing time** (22:00 and 10:00 MSK / 19:00 and 07:00 UTC).
+
+#### What prompts appear when a model is unavailable or drops connection?
+1. **Mid-stream connection drop:** Shows a prompt with a 30s countdown:
+   - `⏳ Keep <model> (continue now)` — resumes on the current model.
+   - `🔀 Switch to gpt-6.1-sol` — switches to `gpt-6.1-sol` and resumes.
+   - `⏹️ Stop` — halts generation.
+   *If no option is selected within 30s, it auto-retries on the current model. After 3 consecutive drops, it auto-switches to `gpt-6.1-sol`.*
+2. **Rate Limit (429):** 60s countdown prompt to retry immediately, switch to `gpt-6.1-sol`, or stop. Auto-retries when the 60s timer expires.
+3. **Quota Exhausted (402):** Prompts to switch to `gpt-6.1-sol` or stop.
+
+#### Why does it rewrite the User-Agent?
+AgentRouter returns `401 unauthorized client detected` for `pi/<version>` headers. The extension rewrites outgoing User-Agent headers on `fetch` to whitelisted formats (`pi (...)` / `pi-coding-agent`), preserves all auth and custom headers, clones request bodies so retries don't fail, and auto-retries if a 401 occurs.
+
+#### How do I install or develop the extension locally?
+To run directly from a local git clone:
+```bash
+pi install /path/to/pi-agentrouter
+```
+Pi loads the local directory directly from the resolved path without copying, so any edits to `index.ts` take effect immediately.
 
 #### Does pacing slow down other providers?
 No. Request pacing is isolated per provider via dedicated lock files and applied exclusively to requests routed to `agentrouter.org`. Direct provider connections (Google Gemini, Anthropic, local Ollama) run without pacing delays.
